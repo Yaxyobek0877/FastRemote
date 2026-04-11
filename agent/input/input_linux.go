@@ -5,12 +5,38 @@ package input
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+var (
+	xdotoolStdin io.WriteCloser
+	xdotoolMu    sync.Mutex
+	xdotoolOnce  sync.Once
+)
+
+func initXdotool() {
+	// Start xdotool once to accept commands via stdin for smooth input
+	cmd := exec.Command("xdotool", "-")
+	stdin, err := cmd.StdinPipe()
+	if err == nil {
+		xdotoolStdin = stdin
+		err = cmd.Start()
+		if err != nil {
+			log.Printf("[Input] Failed to start persistent xdotool: %v", err)
+			xdotoolStdin = nil
+		} else {
+			log.Println("[Input] xdotool persistent stdin session started")
+		}
+	} else {
+		log.Printf("[Input] Failed to create StdinPipe for xdotool: %v", err)
+	}
+}
 
 // Handler handles input injection on Linux using xdotool
 type Handler struct {
@@ -22,6 +48,7 @@ type Handler struct {
 func New() *Handler {
 	h := &Handler{}
 	h.updateScreenSize()
+	xdotoolOnce.Do(initXdotool)
 	return h
 }
 
@@ -227,6 +254,17 @@ func (h *Handler) TypeText(text string) error {
 }
 
 func runXdotool(args ...string) error {
+	xdotoolMu.Lock()
+	defer xdotoolMu.Unlock()
+
+	// Fast path: use persistent xdotool process if available
+	if xdotoolStdin != nil {
+		cmdStr := strings.Join(args, " ") + "\n"
+		_, err := xdotoolStdin.Write([]byte(cmdStr))
+		return err
+	}
+
+	// Fallback to one-off process
 	cmd := exec.Command("xdotool", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {

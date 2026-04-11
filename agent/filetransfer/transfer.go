@@ -245,3 +245,96 @@ func (h *Handler) UploadFileChunk(rawPayload json.RawMessage) {
 		})
 	}
 }
+
+// DeletePath deletes a file or directory
+func (h *Handler) DeletePath(path string) {
+	path = filepath.Clean(path)
+
+	if path == "/" || path == "\\" || path == "." {
+		h.sendMsg("file_operation_result", map[string]interface{}{
+			"operation": "delete",
+			"path":      path,
+			"error":     "cannot delete root or current directory",
+		})
+		return
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		h.sendMsg("file_operation_result", map[string]interface{}{
+			"operation": "delete",
+			"path":      path,
+			"error":     err.Error(),
+		})
+		return
+	}
+
+	if info.IsDir() {
+		err = os.RemoveAll(path)
+	} else {
+		err = os.Remove(path)
+	}
+
+	if err != nil {
+		h.sendMsg("file_operation_result", map[string]interface{}{
+			"operation": "delete",
+			"path":      path,
+			"error":     err.Error(),
+		})
+		return
+	}
+
+	log.Printf("[FileTransfer] Deleted: %s", path)
+	h.sendMsg("file_operation_result", map[string]interface{}{
+		"operation": "delete",
+		"path":      path,
+		"success":   true,
+	})
+}
+
+// CreateDirectory creates a new directory
+func (h *Handler) CreateDirectory(path string) {
+	path = filepath.Clean(path)
+
+	err := os.MkdirAll(path, 0755)
+	if err != nil {
+		h.sendMsg("file_operation_result", map[string]interface{}{
+			"operation": "mkdir",
+			"path":      path,
+			"error":     err.Error(),
+		})
+		return
+	}
+
+	log.Printf("[FileTransfer] Created directory: %s", path)
+	h.sendMsg("file_operation_result", map[string]interface{}{
+		"operation": "mkdir",
+		"path":      path,
+		"success":   true,
+	})
+}
+
+// RenamePath renames/moves a file or directory
+func (h *Handler) RenamePath(oldPath, newPath string) {
+	oldPath = filepath.Clean(oldPath)
+	newPath = filepath.Clean(newPath)
+
+	err := os.Rename(oldPath, newPath)
+	if err != nil {
+		h.sendMsg("file_operation_result", map[string]interface{}{
+			"operation": "rename",
+			"oldPath":   oldPath,
+			"newPath":   newPath,
+			"error":     err.Error(),
+		})
+		return
+	}
+
+	log.Printf("[FileTransfer] Renamed: %s -> %s", oldPath, newPath)
+	h.sendMsg("file_operation_result", map[string]interface{}{
+		"operation": "rename",
+		"oldPath":   oldPath,
+		"newPath":   newPath,
+		"success":   true,
+	})
+}

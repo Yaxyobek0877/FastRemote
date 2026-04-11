@@ -68,6 +68,19 @@ type FileDownloadRequest struct {
 	Path string `json:"path"`
 }
 
+type FileDeleteRequest struct {
+	Path string `json:"path"`
+}
+
+type FileMkdirRequest struct {
+	Path string `json:"path"`
+}
+
+type FileRenameRequest struct {
+	OldPath string `json:"oldPath"`
+	NewPath string `json:"newPath"`
+}
+
 type QualitySettings struct {
 	FPS       int `json:"fps"`
 	Quality   int `json:"quality"`
@@ -94,7 +107,7 @@ var (
 	userStore     *UserStore
 
 	viewersMu     sync.RWMutex
-	directViewers map[*websocket.Conn]bool
+	directViewers map[*websocket.Conn]*sync.Mutex
 )
 
 var upgrader = websocket.Upgrader{
@@ -136,7 +149,7 @@ func main() {
 	cursorTracker = capture.NewCursorTracker(capturer.ActualWidth, capturer.ActualHeight)
 	inputH = input.New()
 	startMouseCoalescer()
-	directViewers = make(map[*websocket.Conn]bool)
+	directViewers = make(map[*websocket.Conn]*sync.Mutex)
 
 	log.Printf("Device: %s", deviceName)
 	log.Printf("IP Address: %s", getLocalIP())
@@ -470,7 +483,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hostname string) {
 
 	// Register viewer
 	viewersMu.Lock()
-	directViewers[conn] = true
+	directViewers[conn] = &sync.Mutex{}
 	viewerCount := len(directViewers)
 	viewersMu.Unlock()
 
@@ -562,7 +575,7 @@ func handleViewerMessage(msg WSMessage, viewerConn *websocket.Conn, fileHandler 
 	case "shell_resize":
 		var resize ShellResize
 		if err := json.Unmarshal(msg.Payload, &resize); err == nil {
-			handleShellResize(resize)
+			handleShellResize(resize, viewerConn)
 		}
 
 	case "quality_settings":
@@ -586,6 +599,24 @@ func handleViewerMessage(msg WSMessage, viewerConn *websocket.Conn, fileHandler 
 	case "file_upload_data":
 		go fileHandler.UploadFileChunk(msg.Payload)
 
+	case "file_delete":
+		var req FileDeleteRequest
+		if err := json.Unmarshal(msg.Payload, &req); err == nil {
+			go fileHandler.DeletePath(req.Path)
+		}
+
+	case "file_mkdir":
+		var req FileMkdirRequest
+		if err := json.Unmarshal(msg.Payload, &req); err == nil {
+			go fileHandler.CreateDirectory(req.Path)
+		}
+
+	case "file_rename":
+		var req FileRenameRequest
+		if err := json.Unmarshal(msg.Payload, &req); err == nil {
+			go fileHandler.RenamePath(req.OldPath, req.NewPath)
+		}
+
 	default:
 		log.Printf("[WS] Unknown message type: %s", msg.Type)
 	}
@@ -599,8 +630,10 @@ func frameDistributor() {
 	for frame := range capturer.Frames() {
 		// Send to all viewers
 		viewersMu.RLock()
-		for viewer := range directViewers {
+		for viewer, mu := range directViewers {
+			mu.Lock()
 			viewer.WriteMessage(websocket.BinaryMessage, frame)
+			mu.Unlock()
 		}
 		viewersMu.RUnlock()
 	}
@@ -635,7 +668,7 @@ var (
 func startMouseCoalescer() {
 	// Mouse coalescer: executes latest mouse position at 125Hz
 	go func() {
-		ticker := time.NewTicker(8 * time.Millisecond)
+		ticker := time.NewTicker(4 * time.Millisecond)
 		defer ticker.Stop()
 		for range ticker.C {
 			mouseMoveMu.Lock()
@@ -721,7 +754,7 @@ func handleKeyboardEvent(event KeyboardEvent) {
 	}
 }
 
-func handleShellInput(data string, viewerConn *websocket.Conn) {
+func ensureShellStarted(viewerConn *websocket.Conn) {
 	if shellSess == nil || !shellSess.IsActive() {
 		var err error
 		shellSess, err = shell.New()
@@ -735,11 +768,17 @@ func handleShellInput(data string, viewerConn *websocket.Conn) {
 		}
 		go shellOutputForwarder()
 	}
-
-	shellSess.Write(data)
 }
 
-func handleShellResize(resize ShellResize) {
+func handleShellInput(data string, viewerConn *websocket.Conn) {
+	ensureShellStarted(viewerConn)
+	if shellSess != nil && shellSess.IsActive() {
+		shellSess.Write(data)
+	}
+}
+
+func handleShellResize(resize ShellResize, viewerConn *websocket.Conn) {
+	ensureShellStarted(viewerConn)
 	if shellSess != nil && shellSess.IsActive() {
 		if resize.Cols > 0 && resize.Rows > 0 {
 			shellSess.Resize(uint16(resize.Cols), uint16(resize.Rows))
@@ -756,6 +795,7 @@ func handleQualitySettings(settings QualitySettings) {
 	fps, quality, maxW, maxH := capturer.GetSettings()
 	viewersMu.RLock()
 	for viewer := range directViewers {
+		// sendJSONToConn handles its own locking for the conn
 		sendJSONToConn(viewer, "quality_ack", map[string]int{
 			"fps": fps, "quality": quality, "maxWidth": maxW, "maxHeight": maxH,
 		})
@@ -791,7 +831,18 @@ func sendJSONToConn(conn *websocket.Conn, msgType string, payload interface{}) {
 		Payload:  payloadBytes,
 	}
 	data, _ := json.Marshal(msg)
-	conn.WriteMessage(websocket.TextMessage, data)
+
+	viewersMu.RLock()
+	mu, ok := directViewers[conn]
+	viewersMu.RUnlock()
+
+	if ok {
+		mu.Lock()
+		conn.WriteMessage(websocket.TextMessage, data)
+		mu.Unlock()
+	} else {
+		conn.WriteMessage(websocket.TextMessage, data)
+	}
 }
 
 func sendSystemInfo(conn *websocket.Conn, deviceName, hostname string) {

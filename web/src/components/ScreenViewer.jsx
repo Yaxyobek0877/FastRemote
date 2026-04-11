@@ -1,84 +1,93 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 
-const QUALITY_PRESETS = {
-  low:    { fps: 10, quality: 50, maxWidth: 1920, maxHeight: 1080, label: 'Low',    icon: '📶' },
-  medium: { fps: 15, quality: 70, maxWidth: 2560, maxHeight: 1440, label: 'Medium', icon: '📶' },
-  high:   { fps: 15, quality: 85, maxWidth: 3840, maxHeight: 2160, label: 'High',   icon: '📶' },
-  ultra:  { fps: 25, quality: 95, maxWidth: 3840, maxHeight: 2160, label: 'Ultra',  icon: '🔥' },
-};
-
 export default function ScreenViewer({ ws, isConnected }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
   const cursorOverlayRef = useRef(null);
   const [fps, setFps] = useState(0);
   const [resolution, setResolution] = useState('');
-  const [qualityPreset, setQualityPreset] = useState('high');
-  const [showQualityPanel, setShowQualityPanel] = useState(false);
-  const [remoteCursor, setRemoteCursor] = useState({ x: 0.5, y: 0.5, cursorType: 'default' });
   const [isFocused, setIsFocused] = useState(false);
   const [frameSize, setFrameSize] = useState(0);
+  const [latency, setLatency] = useState(0);
+  const [remoteCursor, setRemoteCursor] = useState({ x: 0.5, y: 0.5, cursorType: 'default' });
   const frameCountRef = useRef(0);
   const lastFpsTimeRef = useRef(Date.now());
   const frameSizeAccum = useRef(0);
   const lastMouseSend = useRef(0);
+  const pendingFrameRef = useRef(null);
+  const rafIdRef = useRef(null);
 
-  // Cursor type CSS mapping
-  const cursorTypeMap = {
-    default: 'default',
-    pointer: 'pointer',
-    text: 'text',
-    wait: 'wait',
-    crosshair: 'crosshair',
-    move: 'move',
-    'not-allowed': 'not-allowed',
-    'col-resize': 'col-resize',
-    'row-resize': 'row-resize',
-    'n-resize': 'n-resize',
-    's-resize': 's-resize',
-    'e-resize': 'e-resize',
-    'w-resize': 'w-resize',
-    'ne-resize': 'ne-resize',
-    'nw-resize': 'nw-resize',
-    'se-resize': 'se-resize',
-    'sw-resize': 'sw-resize',
-    grab: 'grab',
-    grabbing: 'grabbing',
-  };
-
-  // Handle incoming binary frames
+  // Handle incoming binary frames — use createImageBitmap for speed
   const handleFrame = useCallback((data) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    const frameTime = Date.now();
+
+    // Cancel any pending frame render
+    if (pendingFrameRef.current) {
+      pendingFrameRef.current = null;
+    }
+
     const blob = new Blob([data], { type: 'image/jpeg' });
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
 
-    img.onload = () => {
-      const ctx = canvas.getContext('2d');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-      URL.revokeObjectURL(url);
+    // createImageBitmap is async and decodes off the main thread — much faster
+    if (typeof createImageBitmap !== 'undefined') {
+      createImageBitmap(blob).then((bitmap) => {
+        if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = requestAnimationFrame(() => {
+          const ctx = canvas.getContext('2d');
+          if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+            canvas.width = bitmap.width;
+            canvas.height = bitmap.height;
+            setResolution(`${bitmap.width}×${bitmap.height}`);
+          }
+          ctx.drawImage(bitmap, 0, 0);
+          bitmap.close();
 
-      setResolution(`${img.width}×${img.height}`);
+          // Latency measurement (decode time)
+          setLatency(Date.now() - frameTime);
 
-      // FPS counter
-      frameCountRef.current++;
-      frameSizeAccum.current += data.byteLength;
-      const now = Date.now();
-      if (now - lastFpsTimeRef.current >= 1000) {
-        setFps(frameCountRef.current);
-        setFrameSize(Math.round(frameSizeAccum.current / 1024)); // KB/s
-        frameCountRef.current = 0;
-        frameSizeAccum.current = 0;
-        lastFpsTimeRef.current = now;
-      }
-    };
+          // FPS counter
+          frameCountRef.current++;
+          frameSizeAccum.current += data.byteLength;
+          const now = Date.now();
+          if (now - lastFpsTimeRef.current >= 1000) {
+            setFps(frameCountRef.current);
+            setFrameSize(Math.round(frameSizeAccum.current / 1024));
+            frameCountRef.current = 0;
+            frameSizeAccum.current = 0;
+            lastFpsTimeRef.current = now;
+          }
+        });
+      }).catch(() => {});
+    } else {
+      // Fallback for older browsers
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        const ctx = canvas.getContext('2d');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        setResolution(`${img.width}×${img.height}`);
+        setLatency(Date.now() - frameTime);
 
-    img.onerror = () => URL.revokeObjectURL(url);
-    img.src = url;
+        frameCountRef.current++;
+        frameSizeAccum.current += data.byteLength;
+        const now = Date.now();
+        if (now - lastFpsTimeRef.current >= 1000) {
+          setFps(frameCountRef.current);
+          setFrameSize(Math.round(frameSizeAccum.current / 1024));
+          frameCountRef.current = 0;
+          frameSizeAccum.current = 0;
+          lastFpsTimeRef.current = now;
+        }
+      };
+      img.onerror = () => URL.revokeObjectURL(url);
+      img.src = url;
+    }
   }, []);
 
   // Handle cursor position messages
@@ -94,10 +103,10 @@ export default function ScreenViewer({ ws, isConnected }) {
     if (!ws) return;
 
     const handler = (event) => {
-      if (event.data instanceof Blob) {
-        event.data.arrayBuffer().then(handleFrame);
-      } else if (event.data instanceof ArrayBuffer) {
+      if (event.data instanceof ArrayBuffer) {
         handleFrame(event.data);
+      } else if (event.data instanceof Blob) {
+        event.data.arrayBuffer().then(handleFrame);
       } else if (typeof event.data === 'string') {
         try {
           const msg = JSON.parse(event.data);
@@ -114,17 +123,17 @@ export default function ScreenViewer({ ws, isConnected }) {
     return () => ws.removeEventListener('message', handler);
   }, [ws, handleFrame, handleCursorPosition]);
 
-  // Mouse events with throttling
+  // Mouse events — reduced throttle to 8ms (~120Hz)
   const sendMouseEvent = useCallback((e, action) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Throttle mouse move to ~60fps (16ms)
+    // Throttle mouse move to ~120fps (8ms) for smooth performance
     if (action === 'move') {
       const now = Date.now();
-      if (now - lastMouseSend.current < 16) return;
+      if (now - lastMouseSend.current < 8) return;
       lastMouseSend.current = now;
     }
 
@@ -142,8 +151,8 @@ export default function ScreenViewer({ ws, isConnected }) {
       deltaY: e.deltaY || 0,
     };
 
-    // For move events, send raw pixel deltas for 1:1 mouse feel
-    if (action === 'move') {
+    // For move events, send raw pixel deltas for 1:1 mouse feel ONLY if pointer locked
+    if (action === 'move' && document.pointerLockElement === canvas) {
       payload.movementX = e.movementX || 0;
       payload.movementY = e.movementY || 0;
     }
@@ -154,7 +163,6 @@ export default function ScreenViewer({ ws, isConnected }) {
   const handleMouseMove = useCallback((e) => sendMouseEvent(e, 'move'), [sendMouseEvent]);
   const handleMouseDown = useCallback((e) => {
     e.preventDefault();
-    // Explicitly focus the canvas on any mousedown
     if (canvasRef.current && document.activeElement !== canvasRef.current) {
       canvasRef.current.focus();
     }
@@ -162,7 +170,6 @@ export default function ScreenViewer({ ws, isConnected }) {
   }, [sendMouseEvent]);
   const handleMouseUp = useCallback((e) => sendMouseEvent(e, 'up'), [sendMouseEvent]);
   const handleClick = useCallback((e) => {
-    // Ensure focus on click too
     if (canvasRef.current) canvasRef.current.focus();
     sendMouseEvent(e, 'click');
   }, [sendMouseEvent]);
@@ -177,7 +184,6 @@ export default function ScreenViewer({ ws, isConnected }) {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Throttle scroll events
     const now = Date.now();
     if (now - lastScrollSend.current < 50) return;
     lastScrollSend.current = now;
@@ -186,11 +192,9 @@ export default function ScreenViewer({ ws, isConnected }) {
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
 
-    // Normalize deltaY: clamp to small range regardless of browser/OS
-    // Most browsers give 100-150 per tick, smooth scrolling gives 1-30
     let normalizedDelta = e.deltaY;
     if (Math.abs(normalizedDelta) > 50) {
-      normalizedDelta = normalizedDelta > 0 ? 120 : -120; // normalize to 1 click
+      normalizedDelta = normalizedDelta > 0 ? 120 : -120;
     }
 
     ws.send(JSON.stringify({
@@ -215,7 +219,6 @@ export default function ScreenViewer({ ws, isConnected }) {
 
     const handleKeyDown = (e) => {
       if (!isFocused) return;
-      // Don't prevent F11 (fullscreen) or browser dev tools
       if (e.key === 'F11' || (e.ctrlKey && e.shiftKey && e.key === 'I')) return;
 
       e.preventDefault();
@@ -259,7 +262,7 @@ export default function ScreenViewer({ ws, isConnected }) {
     };
   }, [ws, isConnected, isFocused]);
 
-  // Auto-focus canvas on mount and after fullscreen change
+  // Auto-focus canvas on mount
   useEffect(() => {
     if (isConnected && canvasRef.current) {
       canvasRef.current.focus();
@@ -269,7 +272,6 @@ export default function ScreenViewer({ ws, isConnected }) {
   // Re-focus canvas on fullscreen change
   useEffect(() => {
     const onFullscreenChange = () => {
-      // When entering or exiting fullscreen, re-focus the canvas
       setTimeout(() => {
         if (canvasRef.current) canvasRef.current.focus();
       }, 100);
@@ -278,39 +280,10 @@ export default function ScreenViewer({ ws, isConnected }) {
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
 
-  // Click on the container (anywhere in screen-viewer) should focus canvas
+  // Click on the container should focus canvas
   const handleContainerClick = useCallback(() => {
     if (canvasRef.current) canvasRef.current.focus();
   }, []);
-
-  // Quality preset change
-  const changeQuality = useCallback((preset) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const settings = QUALITY_PRESETS[preset];
-    if (!settings) return;
-
-    setQualityPreset(preset);
-    ws.send(JSON.stringify({
-      type: 'quality_settings',
-      payload: {
-        fps: settings.fps,
-        quality: settings.quality,
-        maxWidth: settings.maxWidth,
-        maxHeight: settings.maxHeight,
-      }
-    }));
-  }, [ws]);
-
-  const toggleFullscreen = () => {
-    const viewer = containerRef.current;
-    if (!viewer) return;
-
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    } else {
-      viewer.requestFullscreen();
-    }
-  };
 
   if (!isConnected) {
     return (
@@ -373,6 +346,15 @@ export default function ScreenViewer({ ws, isConnected }) {
         <div className="screen-info">{resolution}</div>
         <div className="screen-info">{fps} FPS</div>
         <div className="screen-info">{frameSize} KB/s</div>
+        <div className="screen-info">{latency}ms</div>
+        <div 
+          className="screen-info" 
+          style={{ cursor: 'pointer', background: 'rgba(255,255,255,0.1)' }} 
+          onClick={(e) => { e.stopPropagation(); if (canvasRef.current) canvasRef.current.requestPointerLock(); }}
+          title="Lock pointer for 3D games (Press ESC to exit)"
+        >
+          🔒 Lock Pointer
+        </div>
         <div className={`screen-info focus-indicator ${isFocused ? 'active' : ''}`}>
           {isFocused ? '🟢 Active' : '⚪ Click to Control'}
         </div>
@@ -380,4 +362,3 @@ export default function ScreenViewer({ ws, isConnected }) {
     </div>
   );
 }
-

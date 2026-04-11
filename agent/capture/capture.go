@@ -2,7 +2,6 @@ package capture
 
 import (
 	"bytes"
-	"crypto/md5"
 	"image"
 	"image/jpeg"
 	"log"
@@ -32,9 +31,12 @@ type Capturer struct {
 	droppedFrames  int
 	totalFrames    int
 
-	// Delta detection
-	lastFrameHash [md5.Size]byte
+	// Delta detection — fast byte comparison instead of MD5
+	lastFrame     []byte
 	skipIdentical bool
+
+	// Buffer pool for JPEG encoding
+	bufPool sync.Pool
 
 	// Actual screen size (for cursor normalization)
 	ActualWidth  int
@@ -70,14 +72,19 @@ func New(fps, quality, maxWidth, maxHeight int) *Capturer {
 		quality:        quality,
 		maxWidth:       maxWidth,
 		maxHeight:      maxHeight,
-		frameChan:      make(chan []byte, 5),
+		frameChan:      make(chan []byte, 2), // Reduced from 5 to 2 for lower latency
 		baseQuality:    quality,
 		currentQuality: quality,
-		minQuality:     50,
-		maxQuality:     95,
+		minQuality:     30,
+		maxQuality:     100,
 		skipIdentical:  true,
 		ActualWidth:    actualW,
 		ActualHeight:   actualH,
+		bufPool: sync.Pool{
+			New: func() interface{} {
+				return new(bytes.Buffer)
+			},
+		},
 	}
 }
 
@@ -258,32 +265,72 @@ func (c *Capturer) captureFrame() ([]byte, error) {
 	// Resize if needed
 	resized := c.resizeImage(img)
 
-	// Encode to JPEG
+	// Encode to JPEG using pooled buffer
 	c.mu.Lock()
 	quality := c.currentQuality
 	c.mu.Unlock()
 
-	var buf bytes.Buffer
-	err = jpeg.Encode(&buf, resized, &jpeg.Options{Quality: quality})
+	buf := c.bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	err = jpeg.Encode(buf, resized, &jpeg.Options{Quality: quality})
 	if err != nil {
+		c.bufPool.Put(buf)
 		return nil, err
 	}
 
-	frameData := buf.Bytes()
+	frameData := make([]byte, buf.Len())
+	copy(frameData, buf.Bytes())
+	c.bufPool.Put(buf)
 
-	// Delta detection: skip if frame is identical to last
-	if c.skipIdentical {
-		hash := md5.Sum(frameData)
-		c.mu.Lock()
-		if hash == c.lastFrameHash {
-			c.mu.Unlock()
-			return nil, nil // No change
-		}
-		c.lastFrameHash = hash
-		c.mu.Unlock()
+	// Fast delta detection: compare frame size first, then sample bytes
+	if c.skipIdentical && c.fastFrameCompare(frameData) {
+		return nil, nil // No significant change
 	}
 
 	return frameData, nil
+}
+
+// fastFrameCompare uses size + sampled byte comparison instead of MD5
+// Returns true if frame is (likely) identical to the last one
+func (c *Capturer) fastFrameCompare(frame []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.lastFrame == nil {
+		c.lastFrame = make([]byte, len(frame))
+		copy(c.lastFrame, frame)
+		return false
+	}
+
+	// Different size = definitely different
+	if len(frame) != len(c.lastFrame) {
+		c.lastFrame = make([]byte, len(frame))
+		copy(c.lastFrame, frame)
+		return false
+	}
+
+	// Sample comparison: check every Nth byte for speed
+	// For a 100KB frame, checking every 64th byte = ~1500 comparisons
+	step := len(frame) / 1500
+	if step < 1 {
+		step = 1
+	}
+
+	identical := true
+	for i := 0; i < len(frame); i += step {
+		if frame[i] != c.lastFrame[i] {
+			identical = false
+			break
+		}
+	}
+
+	if !identical {
+		copy(c.lastFrame[:0], frame) // reuse slice if possible
+		c.lastFrame = append(c.lastFrame[:0], frame...)
+	}
+
+	return identical
 }
 
 func (c *Capturer) resizeImage(src image.Image) image.Image {
