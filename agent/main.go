@@ -98,16 +98,30 @@ type SystemInfo struct {
 	ScreenHeight int    `json:"screenHeight"`
 }
 
+// wsMsg is a message for the per-viewer write channels
+type wsMsg struct {
+	msgType int    // websocket.BinaryMessage or websocket.TextMessage
+	data    []byte
+}
+
+type Viewer struct {
+	FrameChan chan []byte  // video frames (high priority)
+	JsonChan  chan wsMsg   // JSON messages (cursor, shell output, etc.)
+	WriteMu   *sync.Mutex // fallback mutex for direct writes (pre-registration)
+	Done      chan struct{}
+}
+
 var (
 	capturer      *capture.Capturer
 	cursorTracker *capture.CursorTracker
+	audioCapturer *capture.AudioCapturer
 	inputH        *input.Handler
 	shellSess     *shell.Shell
 	deviceID      string
 	userStore     *UserStore
 
 	viewersMu     sync.RWMutex
-	directViewers map[*websocket.Conn]*sync.Mutex
+	directViewers map[*websocket.Conn]*Viewer
 )
 
 var upgrader = websocket.Upgrader{
@@ -147,9 +161,10 @@ func main() {
 	// Initialize components — native resolution, high quality
 	capturer = capture.New(15, 85, 0, 0) // 0,0 = auto-detect (up to 4K)
 	cursorTracker = capture.NewCursorTracker(capturer.ActualWidth, capturer.ActualHeight)
+	audioCapturer = capture.NewAudioCapturer()
 	inputH = input.New()
 	startMouseCoalescer()
-	directViewers = make(map[*websocket.Conn]*sync.Mutex)
+	directViewers = make(map[*websocket.Conn]*Viewer)
 
 	log.Printf("Device: %s", deviceName)
 	log.Printf("IP Address: %s", getLocalIP())
@@ -160,6 +175,8 @@ func main() {
 	go frameDistributor()
 	// Start cursor distribution goroutine
 	go cursorDistributor()
+	// Start audio distribution goroutine
+	go audioDistributor()
 
 	// Start HTTP Server
 	startServer(port, deviceName, hostname)
@@ -482,10 +499,64 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hostname string) {
 	sendSystemInfo(conn, deviceName, hostname)
 
 	// Register viewer
+	v := &Viewer{
+		FrameChan: make(chan []byte, 3),  // video frames (high priority)
+		JsonChan:  make(chan wsMsg, 30),  // JSON messages (lower priority)
+		WriteMu:   &sync.Mutex{},
+		Done:      make(chan struct{}),
+	}
 	viewersMu.Lock()
-	directViewers[conn] = &sync.Mutex{}
+	directViewers[conn] = v
 	viewerCount := len(directViewers)
 	viewersMu.Unlock()
+
+	// PRIORITY WRITER: frames always take priority over JSON messages.
+	// This prevents cursor/shell updates from starving frame delivery.
+	go func(c *websocket.Conn, viewer *Viewer) {
+		defer func() {
+			select {
+			case <-viewer.Done:
+			default:
+			}
+		}()
+		for {
+			// Priority 1: always try to send a frame first
+			select {
+			case frame, ok := <-viewer.FrameChan:
+				if !ok {
+					return
+				}
+				c.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if err := c.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+					return
+				}
+				continue // Check for more frames before processing JSON
+			default:
+			}
+
+			// Priority 2: no frame pending — wait for either frame or JSON
+			select {
+			case frame, ok := <-viewer.FrameChan:
+				if !ok {
+					return
+				}
+				c.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if err := c.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+					return
+				}
+			case msg, ok := <-viewer.JsonChan:
+				if !ok {
+					return
+				}
+				c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if err := c.WriteMessage(msg.msgType, msg.data); err != nil {
+					return
+				}
+			case <-viewer.Done:
+				return
+			}
+		}
+	}(conn, v)
 
 	// Start screen capture and cursor tracking if this is the first viewer
 	if viewerCount == 1 {
@@ -537,7 +608,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hostname string) {
 	// Unregister viewer
 	pingTicker.Stop()
 	viewersMu.Lock()
-	delete(directViewers, conn)
+	if v, ok := directViewers[conn]; ok {
+		delete(directViewers, conn)
+		close(v.Done)      // Signal the priority writer to stop
+		close(v.FrameChan) // Stop frame delivery
+		close(v.JsonChan)  // Stop JSON delivery
+	}
 	viewerCount = len(directViewers)
 	viewersMu.Unlock()
 	conn.Close()
@@ -617,6 +693,12 @@ func handleViewerMessage(msg WSMessage, viewerConn *websocket.Conn, fileHandler 
 			go fileHandler.RenamePath(req.OldPath, req.NewPath)
 		}
 
+	case "audio_start":
+		handleAudioStart()
+
+	case "audio_stop":
+		handleAudioStop()
+
 	default:
 		log.Printf("[WS] Unknown message type: %s", msg.Type)
 	}
@@ -628,12 +710,19 @@ func handleViewerMessage(msg WSMessage, viewerConn *websocket.Conn, fileHandler 
 
 func frameDistributor() {
 	for frame := range capturer.Frames() {
-		// Send to all viewers
+		// Send to all viewers with "latest frame swap" — drain stale, push fresh
 		viewersMu.RLock()
-		for viewer, mu := range directViewers {
-			mu.Lock()
-			viewer.WriteMessage(websocket.BinaryMessage, frame)
-			mu.Unlock()
+		for _, v := range directViewers {
+			// Drain any stale frame first
+			select {
+			case <-v.FrameChan:
+			default:
+			}
+			// Push new frame
+			select {
+			case v.FrameChan <- frame:
+			default:
+			}
 		}
 		viewersMu.RUnlock()
 	}
@@ -645,13 +734,54 @@ func frameDistributor() {
 
 func cursorDistributor() {
 	for cursorInfo := range cursorTracker.Updates() {
-		// Send cursor position to all viewers as JSON
+		payloadBytes, _ := json.Marshal(cursorInfo)
+		msg := WSMessage{
+			Type:     "cursor_position",
+			DeviceID: deviceID,
+			Payload:  payloadBytes,
+		}
+		data, _ := json.Marshal(msg)
+
 		viewersMu.RLock()
-		for viewer := range directViewers {
-			sendJSONToConn(viewer, "cursor_position", cursorInfo)
+		for _, v := range directViewers {
+			select {
+			case v.JsonChan <- wsMsg{msgType: websocket.TextMessage, data: data}:
+			default:
+			}
 		}
 		viewersMu.RUnlock()
 	}
+}
+
+// ============================================================
+// AUDIO DISTRIBUTOR
+// ============================================================
+
+func audioDistributor() {
+	for chunk := range audioCapturer.Chunks() {
+		viewersMu.RLock()
+		for _, v := range directViewers {
+			audioMsg := make([]byte, 1+len(chunk))
+			audioMsg[0] = 'A'
+			copy(audioMsg[1:], chunk)
+
+			select {
+			case v.JsonChan <- wsMsg{msgType: websocket.BinaryMessage, data: audioMsg}:
+			default:
+			}
+		}
+		viewersMu.RUnlock()
+	}
+}
+
+func handleAudioStart() {
+	log.Println("[Audio] Starting audio capture...")
+	audioCapturer.Start()
+}
+
+func handleAudioStop() {
+	log.Println("[Audio] Stopping audio capture...")
+	audioCapturer.Stop()
 }
 
 // Mouse move coalescing for smooth movement
@@ -694,6 +824,9 @@ func startMouseCoalescer() {
 }
 
 func handleMouseEvent(event MouseEvent) {
+	// Force frame capture to bypass delta detection during mouse interaction
+	capturer.ForceNextFrame()
+
 	switch event.Action {
 	case "move":
 		// Use relative mode if movementX/Y are provided
@@ -726,6 +859,9 @@ func handleMouseEvent(event MouseEvent) {
 }
 
 func handleKeyboardEvent(event KeyboardEvent) {
+	// Force frame capture to ensure screen updates after keyboard input
+	capturer.ForceNextFrame()
+
 	switch event.Action {
 	case "keydown":
 		if event.Ctrl || event.Alt || event.Meta {
@@ -833,15 +969,15 @@ func sendJSONToConn(conn *websocket.Conn, msgType string, payload interface{}) {
 	data, _ := json.Marshal(msg)
 
 	viewersMu.RLock()
-	mu, ok := directViewers[conn]
+	v, ok := directViewers[conn]
 	viewersMu.RUnlock()
 
-	if ok {
-		mu.Lock()
-		conn.WriteMessage(websocket.TextMessage, data)
-		mu.Unlock()
-	} else {
-		conn.WriteMessage(websocket.TextMessage, data)
+	if ok && v.JsonChan != nil {
+		// Route through JSON write channel (non-blocking)
+		select {
+		case v.JsonChan <- wsMsg{msgType: websocket.TextMessage, data: data}:
+		default:
+		}
 	}
 }
 
@@ -855,7 +991,15 @@ func sendSystemInfo(conn *websocket.Conn, deviceName, hostname string) {
 		ScreenWidth:  capturer.ActualWidth,
 		ScreenHeight: capturer.ActualHeight,
 	}
-	sendJSONToConn(conn, "system_info", info)
+	// Direct write — called before viewer registration, no concurrent writers yet
+	payloadBytes, _ := json.Marshal(info)
+	msg := WSMessage{
+		Type:     "system_info",
+		DeviceID: deviceID,
+		Payload:  payloadBytes,
+	}
+	data, _ := json.Marshal(msg)
+	conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // ============================================================

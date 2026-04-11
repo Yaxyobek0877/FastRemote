@@ -1,107 +1,208 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 
+// Cursor SVG paths by type
+const CURSOR_SHAPES = {
+  default: (
+    <svg width="20" height="20" viewBox="0 0 20 20">
+      <path d="M2 2 L2 16 L6.5 11.5 L11 18 L14 16.5 L9.5 10 L16 10 Z"
+        fill="rgba(255,255,255,0.95)" stroke="rgba(0,0,0,0.85)" strokeWidth="1.5"/>
+    </svg>
+  ),
+  text: (
+    <svg width="16" height="22" viewBox="0 0 16 22">
+      <line x1="8" y1="2" x2="8" y2="20" stroke="rgba(255,255,255,0.95)" strokeWidth="2.5"/>
+      <line x1="8" y1="2" x2="8" y2="20" stroke="rgba(0,0,0,0.8)" strokeWidth="1.5"/>
+      <line x1="4" y1="2" x2="12" y2="2" stroke="rgba(0,0,0,0.8)" strokeWidth="1.5"/>
+      <line x1="4" y1="20" x2="12" y2="20" stroke="rgba(0,0,0,0.8)" strokeWidth="1.5"/>
+      <line x1="4" y1="2" x2="12" y2="2" stroke="rgba(255,255,255,0.9)" strokeWidth="1"/>
+      <line x1="4" y1="20" x2="12" y2="20" stroke="rgba(255,255,255,0.9)" strokeWidth="1"/>
+    </svg>
+  ),
+  pointer: (
+    <svg width="20" height="22" viewBox="0 0 20 22">
+      <path d="M6 2 L6 14 L9 11 L14 18 L16 16 L11 9 L15 9 Z"
+        fill="rgba(255,255,255,0.95)" stroke="rgba(0,0,0,0.85)" strokeWidth="1.3"/>
+    </svg>
+  ),
+  crosshair: (
+    <svg width="22" height="22" viewBox="0 0 22 22">
+      <line x1="11" y1="1" x2="11" y2="21" stroke="rgba(0,0,0,0.7)" strokeWidth="2"/>
+      <line x1="1" y1="11" x2="21" y2="11" stroke="rgba(0,0,0,0.7)" strokeWidth="2"/>
+      <line x1="11" y1="1" x2="11" y2="21" stroke="rgba(255,255,255,0.9)" strokeWidth="1"/>
+      <line x1="1" y1="11" x2="21" y2="11" stroke="rgba(255,255,255,0.9)" strokeWidth="1"/>
+      <circle cx="11" cy="11" r="3" fill="none" stroke="rgba(255,255,255,0.8)" strokeWidth="1"/>
+    </svg>
+  ),
+  move: (
+    <svg width="22" height="22" viewBox="0 0 22 22">
+      <path d="M11 1 L14 5 L12 5 L12 9 L16 9 L16 7 L20 11 L16 15 L16 13 L12 13 L12 17 L14 17 L11 21 L8 17 L10 17 L10 13 L6 13 L6 15 L2 11 L6 7 L6 9 L10 9 L10 5 L8 5 Z"
+        fill="rgba(255,255,255,0.95)" stroke="rgba(0,0,0,0.8)" strokeWidth="1"/>
+    </svg>
+  ),
+  wait: (
+    <svg width="18" height="22" viewBox="0 0 18 22">
+      <rect x="3" y="1" width="12" height="20" rx="2" fill="none" stroke="rgba(0,0,0,0.7)" strokeWidth="1.5"/>
+      <path d="M5 4 L13 4 L9 10 Z" fill="rgba(59,130,246,0.8)" stroke="none"/>
+      <path d="M5 18 L13 18 L9 12 Z" fill="rgba(255,255,255,0.5)" stroke="none"/>
+    </svg>
+  ),
+};
+
 export default function ScreenViewer({ ws, isConnected }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
-  const cursorOverlayRef = useRef(null);
+  const cursorRef = useRef(null);
   const [fps, setFps] = useState(0);
   const [resolution, setResolution] = useState('');
   const [isFocused, setIsFocused] = useState(false);
   const [frameSize, setFrameSize] = useState(0);
   const [latency, setLatency] = useState(0);
-  const [remoteCursor, setRemoteCursor] = useState({ x: 0.5, y: 0.5, cursorType: 'default' });
+  const [cursorType, setCursorType] = useState('default');
+  const [audioEnabled, setAudioEnabled] = useState(false);
+  const [audioAvailable, setAudioAvailable] = useState(true);
   const frameCountRef = useRef(0);
   const lastFpsTimeRef = useRef(Date.now());
   const frameSizeAccum = useRef(0);
   const lastMouseSend = useRef(0);
-  const pendingFrameRef = useRef(null);
-  const rafIdRef = useRef(null);
+  const isDecodingRef = useRef(false);
+  const decodeTimeoutRef = useRef(null);
 
-  // Handle incoming binary frames — use createImageBitmap for speed
+  // Audio refs
+  const audioCtxRef = useRef(null);
+  const audioEnabledRef = useRef(false);
+  const audioNextTime = useRef(0);
+
+  // Track whether user is actively moving mouse (vs remote cursor update)
+  const userMouseActive = useRef(false);
+  const userMouseTimer = useRef(null);
+
+  // ==========================================
+  // FRAME HANDLER
+  // ==========================================
   const handleFrame = useCallback((data) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    // Audio check
+    const view = new Uint8Array(data);
+    if (view[0] === 0x41) {
+      handleAudioChunk(data.slice(1));
+      return;
+    }
+
+    // Drop if still decoding — but with safety timeout
+    if (isDecodingRef.current) return;
+
     const frameTime = Date.now();
-
-    // Cancel any pending frame render
-    if (pendingFrameRef.current) {
-      pendingFrameRef.current = null;
-    }
-
     const blob = new Blob([data], { type: 'image/jpeg' });
+    isDecodingRef.current = true;
 
-    // createImageBitmap is async and decodes off the main thread — much faster
-    if (typeof createImageBitmap !== 'undefined') {
-      createImageBitmap(blob).then((bitmap) => {
-        if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
-        rafIdRef.current = requestAnimationFrame(() => {
-          const ctx = canvas.getContext('2d');
-          if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-            canvas.width = bitmap.width;
-            canvas.height = bitmap.height;
-            setResolution(`${bitmap.width}×${bitmap.height}`);
-          }
-          ctx.drawImage(bitmap, 0, 0);
-          bitmap.close();
+    // Safety timeout: if decode takes >500ms, force reset
+    if (decodeTimeoutRef.current) clearTimeout(decodeTimeoutRef.current);
+    decodeTimeoutRef.current = setTimeout(() => {
+      isDecodingRef.current = false;
+    }, 500);
 
-          // Latency measurement (decode time)
-          setLatency(Date.now() - frameTime);
+    createImageBitmap(blob).then((bitmap) => {
+      if (decodeTimeoutRef.current) clearTimeout(decodeTimeoutRef.current);
 
-          // FPS counter
-          frameCountRef.current++;
-          frameSizeAccum.current += data.byteLength;
-          const now = Date.now();
-          if (now - lastFpsTimeRef.current >= 1000) {
-            setFps(frameCountRef.current);
-            setFrameSize(Math.round(frameSizeAccum.current / 1024));
-            frameCountRef.current = 0;
-            frameSizeAccum.current = 0;
-            lastFpsTimeRef.current = now;
-          }
-        });
-      }).catch(() => {});
-    } else {
-      // Fallback for older browsers
-      const url = URL.createObjectURL(blob);
-      const img = new Image();
-      img.onload = () => {
-        const ctx = canvas.getContext('2d');
-        canvas.width = img.width;
-        canvas.height = img.height;
-        ctx.drawImage(img, 0, 0);
-        URL.revokeObjectURL(url);
-        setResolution(`${img.width}×${img.height}`);
-        setLatency(Date.now() - frameTime);
+      const ctx = canvas.getContext('2d');
+      if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        setResolution(`${bitmap.width}×${bitmap.height}`);
+      }
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close();
 
-        frameCountRef.current++;
-        frameSizeAccum.current += data.byteLength;
-        const now = Date.now();
-        if (now - lastFpsTimeRef.current >= 1000) {
-          setFps(frameCountRef.current);
-          setFrameSize(Math.round(frameSizeAccum.current / 1024));
-          frameCountRef.current = 0;
-          frameSizeAccum.current = 0;
-          lastFpsTimeRef.current = now;
-        }
-      };
-      img.onerror = () => URL.revokeObjectURL(url);
-      img.src = url;
-    }
-  }, []);
+      setLatency(Date.now() - frameTime);
 
-  // Handle cursor position messages
-  const handleCursorPosition = useCallback((payload) => {
-    setRemoteCursor({
-      x: payload.x ?? 0,
-      y: payload.y ?? 0,
-      cursorType: payload.cursorType || 'default',
+      frameCountRef.current++;
+      frameSizeAccum.current += data.byteLength;
+      const now = Date.now();
+      if (now - lastFpsTimeRef.current >= 1000) {
+        setFps(frameCountRef.current);
+        setFrameSize(Math.round(frameSizeAccum.current / 1024));
+        frameCountRef.current = 0;
+        frameSizeAccum.current = 0;
+        lastFpsTimeRef.current = now;
+      }
+      isDecodingRef.current = false;
+    }).catch(() => {
+      if (decodeTimeoutRef.current) clearTimeout(decodeTimeoutRef.current);
+      isDecodingRef.current = false;
     });
   }, []);
 
+  // ==========================================
+  // AUDIO
+  // ==========================================
+  const handleAudioChunk = useCallback((pcmData) => {
+    if (!audioEnabledRef.current || !audioCtxRef.current) return;
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const int16Array = new Int16Array(pcmData);
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768.0;
+    }
+
+    const audioBuffer = ctx.createBuffer(1, float32Array.length, 22050);
+    audioBuffer.getChannelData(0).set(float32Array);
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    const startTime = Math.max(ctx.currentTime, audioNextTime.current);
+    source.start(startTime);
+    audioNextTime.current = startTime + audioBuffer.duration;
+  }, []);
+
+  const toggleAudio = useCallback(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (audioEnabled) {
+      ws.send(JSON.stringify({ type: 'audio_stop' }));
+      audioEnabledRef.current = false;
+      setAudioEnabled(false);
+      if (audioCtxRef.current) { audioCtxRef.current.close(); audioCtxRef.current = null; }
+    } else {
+      try {
+        audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 22050, latencyHint: 'interactive' });
+        audioNextTime.current = 0;
+        audioEnabledRef.current = true;
+        setAudioEnabled(true);
+        ws.send(JSON.stringify({ type: 'audio_start' }));
+      } catch (e) { setAudioAvailable(false); }
+    }
+  }, [ws, audioEnabled]);
+
+  useEffect(() => {
+    return () => {
+      if (audioCtxRef.current) { audioCtxRef.current.close(); audioCtxRef.current = null; }
+      audioEnabledRef.current = false;
+      if (decodeTimeoutRef.current) clearTimeout(decodeTimeoutRef.current);
+    };
+  }, []);
+
+  // ==========================================
+  // SERVER CURSOR SYNC — only update cursor TYPE from server (text, pointer, etc.)
+  // Position is always controlled locally for instant response
+  // ==========================================
+  const handleCursorFromServer = useCallback((payload) => {
+    // Update cursor type from server always
+    if (payload.cursorType) {
+      setCursorType(payload.cursorType);
+    }
+    // NO position override from server — local cursor is always authoritative
+    // This prevents the cursor from snapping back to stale server positions
+  }, []);
+
+  // ==========================================
+  // WEBSOCKET MESSAGES
+  // ==========================================
   useEffect(() => {
     if (!ws) return;
-
     const handler = (event) => {
       if (event.data instanceof ArrayBuffer) {
         handleFrame(event.data);
@@ -111,26 +212,46 @@ export default function ScreenViewer({ ws, isConnected }) {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'cursor_position' && msg.payload) {
-            handleCursorPosition(msg.payload);
+            handleCursorFromServer(msg.payload);
           }
-        } catch (e) {
-          // Not our message
-        }
+        } catch (e) {}
       }
     };
-
     ws.addEventListener('message', handler);
     return () => ws.removeEventListener('message', handler);
-  }, [ws, handleFrame, handleCursorPosition]);
+  }, [ws, handleFrame, handleCursorFromServer]);
 
-  // Mouse events — reduced throttle to 8ms (~120Hz)
+  // ==========================================
+  // LOCAL CURSOR — instant position update
+  // ==========================================
+  const updateLocalCursor = useCallback((e) => {
+    const canvas = canvasRef.current;
+    const cursor = cursorRef.current;
+    if (!canvas || !cursor) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+
+    // GPU-accelerated transform — no layout, no transitions
+    cursor.style.transform = `translate3d(${px}px, ${py}px, 0)`;
+
+    // Mark user as actively moving mouse (suppress server cursor updates for position)
+    userMouseActive.current = true;
+    if (userMouseTimer.current) clearTimeout(userMouseTimer.current);
+    userMouseTimer.current = setTimeout(() => {
+      userMouseActive.current = false;
+    }, 300); // After 300ms of no mouse, re-enable server position sync
+  }, []);
+
+  // ==========================================
+  // MOUSE EVENTS
+  // ==========================================
   const sendMouseEvent = useCallback((e, action) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Throttle mouse move to ~120fps (8ms) for smooth performance
     if (action === 'move') {
       const now = Date.now();
       if (now - lastMouseSend.current < 8) return;
@@ -140,7 +261,6 @@ export default function ScreenViewer({ ws, isConnected }) {
     const rect = canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
-
     const buttonMap = { 0: 'left', 1: 'middle', 2: 'right' };
 
     const payload = {
@@ -151,139 +271,98 @@ export default function ScreenViewer({ ws, isConnected }) {
       deltaY: e.deltaY || 0,
     };
 
-    // For move events, send raw pixel deltas for 1:1 mouse feel ONLY if pointer locked
-    if (action === 'move' && document.pointerLockElement === canvas) {
-      payload.movementX = e.movementX || 0;
-      payload.movementY = e.movementY || 0;
-    }
-
     ws.send(JSON.stringify({ type: 'mouse_event', payload }));
   }, [ws]);
 
-  const handleMouseMove = useCallback((e) => sendMouseEvent(e, 'move'), [sendMouseEvent]);
+  const handleMouseMove = useCallback((e) => {
+    updateLocalCursor(e);
+    sendMouseEvent(e, 'move');
+  }, [updateLocalCursor, sendMouseEvent]);
+
   const handleMouseDown = useCallback((e) => {
     e.preventDefault();
-    if (canvasRef.current && document.activeElement !== canvasRef.current) {
-      canvasRef.current.focus();
-    }
+    if (canvasRef.current && document.activeElement !== canvasRef.current) canvasRef.current.focus();
+    updateLocalCursor(e);
     sendMouseEvent(e, 'down');
-  }, [sendMouseEvent]);
-  const handleMouseUp = useCallback((e) => sendMouseEvent(e, 'up'), [sendMouseEvent]);
+  }, [updateLocalCursor, sendMouseEvent]);
+
+  const handleMouseUp = useCallback((e) => {
+    updateLocalCursor(e);
+    sendMouseEvent(e, 'up');
+  }, [updateLocalCursor, sendMouseEvent]);
+
   const handleClick = useCallback((e) => {
     if (canvasRef.current) canvasRef.current.focus();
+    updateLocalCursor(e);
     sendMouseEvent(e, 'click');
-  }, [sendMouseEvent]);
-  const handleDblClick = useCallback((e) => sendMouseEvent(e, 'dblclick'), [sendMouseEvent]);
-  const handleContextMenu = useCallback((e) => { e.preventDefault(); sendMouseEvent(e, 'click'); }, [sendMouseEvent]);
+  }, [updateLocalCursor, sendMouseEvent]);
 
-  // Scroll with throttle (50ms = max 20 events/sec) and deltaY normalization
+  const handleDblClick = useCallback((e) => {
+    updateLocalCursor(e);
+    sendMouseEvent(e, 'dblclick');
+  }, [updateLocalCursor, sendMouseEvent]);
+
+  const handleContextMenu = useCallback((e) => {
+    e.preventDefault();
+    updateLocalCursor(e);
+    sendMouseEvent(e, 'click');
+  }, [updateLocalCursor, sendMouseEvent]);
+
   const lastScrollSend = useRef(0);
   const handleWheel = useCallback((e) => {
     e.preventDefault();
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-
     const now = Date.now();
     if (now - lastScrollSend.current < 50) return;
     lastScrollSend.current = now;
-
     const rect = canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
-
     let normalizedDelta = e.deltaY;
-    if (Math.abs(normalizedDelta) > 50) {
-      normalizedDelta = normalizedDelta > 0 ? 120 : -120;
-    }
-
+    if (Math.abs(normalizedDelta) > 50) normalizedDelta = normalizedDelta > 0 ? 120 : -120;
     ws.send(JSON.stringify({
       type: 'mouse_event',
-      payload: {
-        x: Math.max(0, Math.min(1, x)),
-        y: Math.max(0, Math.min(1, y)),
-        button: 'left',
-        action: 'scroll',
-        deltaY: normalizedDelta,
-      }
+      payload: { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)), button: 'left', action: 'scroll', deltaY: normalizedDelta }
     }));
   }, [ws]);
 
-  // Focus management for canvas
   const handleCanvasFocus = useCallback(() => setIsFocused(true), []);
   const handleCanvasBlur = useCallback(() => setIsFocused(false), []);
 
-  // Keyboard events — only when canvas is focused
+  // Keyboard
   useEffect(() => {
     if (!ws || !isConnected) return;
-
     const handleKeyDown = (e) => {
       if (!isFocused) return;
       if (e.key === 'F11' || (e.ctrlKey && e.shiftKey && e.key === 'I')) return;
-
       e.preventDefault();
-      ws.send(JSON.stringify({
-        type: 'keyboard_event',
-        payload: {
-          key: e.key,
-          code: e.code,
-          action: 'keydown',
-          ctrl: e.ctrlKey,
-          alt: e.altKey,
-          shift: e.shiftKey,
-          meta: e.metaKey,
-        }
-      }));
+      e.stopPropagation();
+      const key = e.key;
+      const code = e.code;
+      ws.send(JSON.stringify({ type: 'keyboard_event', payload: { key, code, action: 'keydown', ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey } }));
     };
-
     const handleKeyUp = (e) => {
       if (!isFocused) return;
       e.preventDefault();
-      ws.send(JSON.stringify({
-        type: 'keyboard_event',
-        payload: {
-          key: e.key,
-          code: e.code,
-          action: 'keyup',
-          ctrl: e.ctrlKey,
-          alt: e.altKey,
-          shift: e.shiftKey,
-          meta: e.metaKey,
-        }
-      }));
+      e.stopPropagation();
+      ws.send(JSON.stringify({ type: 'keyboard_event', payload: { key: e.key, code: e.code, action: 'keyup', ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey } }));
     };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    window.addEventListener('keyup', handleKeyUp, true);
+    return () => { window.removeEventListener('keydown', handleKeyDown, true); window.removeEventListener('keyup', handleKeyUp, true); };
   }, [ws, isConnected, isFocused]);
 
-  // Auto-focus canvas on mount
+  useEffect(() => { if (isConnected && canvasRef.current) canvasRef.current.focus(); }, [isConnected]);
   useEffect(() => {
-    if (isConnected && canvasRef.current) {
-      canvasRef.current.focus();
-    }
-  }, [isConnected]);
-
-  // Re-focus canvas on fullscreen change
-  useEffect(() => {
-    const onFullscreenChange = () => {
-      setTimeout(() => {
-        if (canvasRef.current) canvasRef.current.focus();
-      }, 100);
-    };
-    document.addEventListener('fullscreenchange', onFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+    const fn = () => { setTimeout(() => { if (canvasRef.current) canvasRef.current.focus(); }, 100); };
+    document.addEventListener('fullscreenchange', fn);
+    return () => document.removeEventListener('fullscreenchange', fn);
   }, []);
 
-  // Click on the container should focus canvas
-  const handleContainerClick = useCallback(() => {
-    if (canvasRef.current) canvasRef.current.focus();
-  }, []);
+  const handleContainerClick = useCallback(() => { if (canvasRef.current) canvasRef.current.focus(); }, []);
+  const handleMouseEnter = useCallback((e) => { updateLocalCursor(e); }, [updateLocalCursor]);
 
   if (!isConnected) {
     return (
@@ -296,10 +375,12 @@ export default function ScreenViewer({ ws, isConnected }) {
     );
   }
 
+  // Pick cursor shape based on cursorType from server
+  const cursorSVG = CURSOR_SHAPES[cursorType] || CURSOR_SHAPES.default;
+
   return (
     <div className="screen-viewer" ref={containerRef} onClick={handleContainerClick}>
-      {/* Canvas wrapper — cursor overlay is relative to this */}
-      <div className="screen-canvas-wrapper" style={{ position: 'relative', display: 'inline-block', maxWidth: '100%', maxHeight: '100%' }}>
+      <div className="screen-canvas-wrapper">
         <canvas
           ref={canvasRef}
           className={`screen-canvas ${isFocused ? 'focused' : ''}`}
@@ -312,31 +393,15 @@ export default function ScreenViewer({ ws, isConnected }) {
           onWheel={handleWheel}
           onFocus={handleCanvasFocus}
           onBlur={handleCanvasBlur}
+          onMouseEnter={handleMouseEnter}
           tabIndex={0}
           id="screen-canvas"
         />
 
-        {/* Remote cursor overlay — positioned relative to canvas */}
+        {/* Cursor overlay — local position (instant) + server cursor type */}
         {isFocused && (
-          <div
-            ref={cursorOverlayRef}
-            className="remote-cursor-dot"
-            style={{
-              position: 'absolute',
-              left: `${remoteCursor.x * 100}%`,
-              top: `${remoteCursor.y * 100}%`,
-              pointerEvents: 'none',
-              zIndex: 5,
-            }}
-          >
-            <svg width="20" height="20" viewBox="0 0 20 20" style={{ position: 'absolute', top: -1, left: -1 }}>
-              <path
-                d="M2 2 L2 16 L6.5 11.5 L11 18 L14 16.5 L9.5 10 L16 10 Z"
-                fill="white"
-                stroke="black"
-                strokeWidth="1.5"
-              />
-            </svg>
+          <div ref={cursorRef} className="local-cursor">
+            {cursorSVG}
           </div>
         )}
       </div>
@@ -347,14 +412,16 @@ export default function ScreenViewer({ ws, isConnected }) {
         <div className="screen-info">{fps} FPS</div>
         <div className="screen-info">{frameSize} KB/s</div>
         <div className="screen-info">{latency}ms</div>
-        <div 
-          className="screen-info" 
-          style={{ cursor: 'pointer', background: 'rgba(255,255,255,0.1)' }} 
-          onClick={(e) => { e.stopPropagation(); if (canvasRef.current) canvasRef.current.requestPointerLock(); }}
-          title="Lock pointer for 3D games (Press ESC to exit)"
-        >
-          🔒 Lock Pointer
-        </div>
+        {audioAvailable && (
+          <div
+            className={`screen-info screen-audio-btn ${audioEnabled ? 'active' : ''}`}
+            onClick={(e) => { e.stopPropagation(); toggleAudio(); }}
+            title={audioEnabled ? 'Click to mute audio' : 'Click to enable audio'}
+          >
+            {audioEnabled ? '🔊 Audio ON' : '🔇 Audio'}
+          </div>
+        )}
+
         <div className={`screen-info focus-indicator ${isFocused ? 'active' : ''}`}>
           {isFocused ? '🟢 Active' : '⚪ Click to Control'}
         </div>

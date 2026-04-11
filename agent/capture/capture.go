@@ -6,6 +6,7 @@ import (
 	"image/jpeg"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kbinani/screenshot"
@@ -28,12 +29,17 @@ type Capturer struct {
 	currentQuality int
 	minQuality     int
 	maxQuality     int
-	droppedFrames  int
-	totalFrames    int
+	droppedFrames  int32 // atomic
+	totalFrames    int32 // atomic
 
-	// Delta detection — fast byte comparison instead of MD5
+	// Delta detection — separate mutex to avoid contention with settings
+	frameMu       sync.Mutex
 	lastFrame     []byte
 	skipIdentical bool
+
+	// Force next frame flag — bypasses delta detection when mouse is active
+	forceNext     int32 // atomic: 1 = force, 0 = normal
+	forceUntil    int64 // atomic: unix nano timestamp until which to force frames
 
 	// Buffer pool for JPEG encoding
 	bufPool sync.Pool
@@ -72,12 +78,12 @@ func New(fps, quality, maxWidth, maxHeight int) *Capturer {
 		quality:        quality,
 		maxWidth:       maxWidth,
 		maxHeight:      maxHeight,
-		frameChan:      make(chan []byte, 2), // Reduced from 5 to 2 for lower latency
+		frameChan:      make(chan []byte, 2), // Buffered(2) — smooths frame delivery, prevents drops
 		baseQuality:    quality,
 		currentQuality: quality,
 		minQuality:     30,
 		maxQuality:     100,
-		skipIdentical:  true,
+		skipIdentical:  false, // Disabled — sampling misses small text edits. FPS ticker is sufficient throttle.
 		ActualWidth:    actualW,
 		ActualHeight:   actualH,
 		bufPool: sync.Pool{
@@ -93,6 +99,27 @@ func (c *Capturer) Frames() <-chan []byte {
 	return c.frameChan
 }
 
+// ForceNextFrame forces the next N milliseconds of frames to bypass delta detection.
+// Call this when the user is actively interacting (mouse move, click, etc.)
+func (c *Capturer) ForceNextFrame() {
+	// Force frames for the next 500ms after any mouse activity
+	atomic.StoreInt64(&c.forceUntil, time.Now().Add(500*time.Millisecond).UnixNano())
+	atomic.StoreInt32(&c.forceNext, 1)
+}
+
+// shouldForceFrame checks if delta detection should be bypassed
+func (c *Capturer) shouldForceFrame() bool {
+	if atomic.LoadInt32(&c.forceNext) == 0 {
+		return false
+	}
+	if time.Now().UnixNano() > atomic.LoadInt64(&c.forceUntil) {
+		// Force period expired
+		atomic.StoreInt32(&c.forceNext, 0)
+		return false
+	}
+	return true
+}
+
 // Start begins screen capture
 func (c *Capturer) Start() {
 	c.mu.Lock()
@@ -104,8 +131,8 @@ func (c *Capturer) Start() {
 
 	c.streaming = true
 	c.stopChan = make(chan struct{})
-	c.droppedFrames = 0
-	c.totalFrames = 0
+	atomic.StoreInt32(&c.droppedFrames, 0)
+	atomic.StoreInt32(&c.totalFrames, 0)
 	go c.captureLoop()
 	log.Printf("[Capture] Started: %d FPS, quality %d, max %dx%d", c.fps, c.quality, c.maxWidth, c.maxHeight)
 }
@@ -121,7 +148,7 @@ func (c *Capturer) Stop() {
 
 	c.streaming = false
 	close(c.stopChan)
-	log.Printf("[Capture] Stopped (dropped %d/%d frames)", c.droppedFrames, c.totalFrames)
+	log.Printf("[Capture] Stopped (dropped %d/%d frames)", atomic.LoadInt32(&c.droppedFrames), atomic.LoadInt32(&c.totalFrames))
 }
 
 // IsStreaming returns whether capture is active
@@ -162,83 +189,53 @@ func (c *Capturer) GetSettings() (fps, quality, maxWidth, maxHeight int) {
 }
 
 func (c *Capturer) captureLoop() {
-	c.mu.Lock()
-	interval := time.Duration(1000/c.fps) * time.Millisecond
-	c.mu.Unlock()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	adaptiveTicker := time.NewTicker(2 * time.Second)
-	defer adaptiveTicker.Stop()
-
 	for {
 		select {
 		case <-c.stopChan:
 			return
-		case <-adaptiveTicker.C:
-			c.adjustQuality()
-			// Update ticker interval if fps changed
-			c.mu.Lock()
-			newInterval := time.Duration(1000/c.fps) * time.Millisecond
-			c.mu.Unlock()
-			if newInterval != interval {
-				interval = newInterval
-				ticker.Reset(interval)
-			}
-		case <-ticker.C:
-			frame, err := c.captureFrame()
-			if err != nil {
-				log.Printf("[Capture] Error: %v", err)
-				continue
-			}
-			if frame == nil {
-				continue // Delta detection: frame unchanged
-			}
+		default:
+		}
 
-			c.mu.Lock()
-			c.totalFrames++
-			c.mu.Unlock()
+		frameStart := time.Now()
 
-			// Non-blocking send (drop frames if buffer full)
+		frame, err := c.captureFrame()
+		if err != nil {
+			log.Printf("[Capture] Error: %v", err)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		if frame != nil {
+			atomic.AddInt32(&c.totalFrames, 1)
+
+			// "Latest frame swap" — drain any stale frame then push new one
+			select {
+			case <-c.frameChan:
+			default:
+			}
 			select {
 			case c.frameChan <- frame:
 			default:
-				c.mu.Lock()
-				c.droppedFrames++
-				c.mu.Unlock()
+				atomic.AddInt32(&c.droppedFrames, 1)
 			}
+		}
+
+		// Precise sleep to hit target FPS
+		c.mu.Lock()
+		interval := time.Duration(1000/c.fps) * time.Millisecond
+		c.mu.Unlock()
+
+		elapsed := time.Since(frameStart)
+		if elapsed < interval {
+			time.Sleep(interval - elapsed)
 		}
 	}
 }
 
 func (c *Capturer) adjustQuality() {
+	// Disabled adaptive quality to respect manual settings
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if c.totalFrames == 0 {
-		return
-	}
-
-	dropRate := float64(c.droppedFrames) / float64(c.totalFrames)
-
-	if dropRate > 0.15 {
-		// Too many drops — reduce quality
-		c.currentQuality -= 10
-		if c.currentQuality < c.minQuality {
-			c.currentQuality = c.minQuality
-		}
-		log.Printf("[Capture] Adaptive: quality ↓ %d (drop rate %.1f%%)", c.currentQuality, dropRate*100)
-	} else if dropRate < 0.03 && c.currentQuality < c.baseQuality {
-		// Low drops — increase quality back toward base
-		c.currentQuality += 5
-		if c.currentQuality > c.baseQuality {
-			c.currentQuality = c.baseQuality
-		}
-		log.Printf("[Capture] Adaptive: quality ↑ %d (drop rate %.1f%%)", c.currentQuality, dropRate*100)
-	}
-
-	// Reset counters
 	c.droppedFrames = 0
 	c.totalFrames = 0
 }
@@ -257,10 +254,12 @@ func (c *Capturer) captureFrame() ([]byte, error) {
 	}
 
 	// Update actual screen size
-	c.mu.Lock()
 	c.ActualWidth = bounds.Dx()
 	c.ActualHeight = bounds.Dy()
-	c.mu.Unlock()
+
+	// No delta detection — every frame is captured and sent.
+	// FPS ticker is sufficient throttle. Delta detection was causing
+	// small text changes to be missed (sampling couldn't catch them).
 
 	// Resize if needed
 	resized := c.resizeImage(img)
@@ -283,54 +282,37 @@ func (c *Capturer) captureFrame() ([]byte, error) {
 	copy(frameData, buf.Bytes())
 	c.bufPool.Put(buf)
 
-	// Fast delta detection: compare frame size first, then sample bytes
-	if c.skipIdentical && c.fastFrameCompare(frameData) {
-		return nil, nil // No significant change
-	}
-
 	return frameData, nil
 }
 
-// fastFrameCompare uses size + sampled byte comparison instead of MD5
-// Returns true if frame is (likely) identical to the last one
+// fastFrameCompare uses sampled byte comparison.
+// Returns true if frame is (likely) identical to the last one.
+// Uses frameMu (NOT c.mu) to avoid blocking settings/quality changes.
 func (c *Capturer) fastFrameCompare(frame []byte) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.frameMu.Lock()
+	defer c.frameMu.Unlock()
 
-	if c.lastFrame == nil {
+	if c.lastFrame == nil || len(frame) != len(c.lastFrame) {
 		c.lastFrame = make([]byte, len(frame))
 		copy(c.lastFrame, frame)
 		return false
 	}
 
-	// Different size = definitely different
-	if len(frame) != len(c.lastFrame) {
-		c.lastFrame = make([]byte, len(frame))
-		copy(c.lastFrame, frame)
-		return false
+	// Sample 500 points — fast enough to never cause frame stalls
+	step := len(frame) / 500
+	if step < 4 {
+		step = 4
 	}
 
-	// Sample comparison: check every Nth byte for speed
-	// For a 100KB frame, checking every 64th byte = ~1500 comparisons
-	step := len(frame) / 1500
-	if step < 1 {
-		step = 1
-	}
-
-	identical := true
 	for i := 0; i < len(frame); i += step {
 		if frame[i] != c.lastFrame[i] {
-			identical = false
-			break
+			// Different — update stored frame and return false
+			copy(c.lastFrame, frame)
+			return false
 		}
 	}
 
-	if !identical {
-		copy(c.lastFrame[:0], frame) // reuse slice if possible
-		c.lastFrame = append(c.lastFrame[:0], frame...)
-	}
-
-	return identical
+	return true
 }
 
 func (c *Capturer) resizeImage(src image.Image) image.Image {
@@ -358,6 +340,7 @@ func (c *Capturer) resizeImage(src image.Image) image.Image {
 	}
 
 	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, srcBounds, draw.Over, nil)
+	// Use NearestNeighbor instead of ApproxBiLinear for real-time speed, massive CPU latency reduction
+	draw.NearestNeighbor.Scale(dst, dst.Bounds(), src, srcBounds, draw.Over, nil)
 	return dst
 }

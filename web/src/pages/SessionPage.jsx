@@ -287,6 +287,7 @@ export default function SessionPage() {
   const [deviceInfo, setDeviceInfo] = useState({ name: 'FastRemote', os: '' });
   const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem('rd_sidebar') !== 'closed');
   const [qualityPreset, setQualityPreset] = useState('high');
+  const [customQuality, setCustomQuality] = useState({ fps: 15, quality: 80, maxWidth: 3840, maxHeight: 2160 });
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [terminalTabs, setTerminalTabs] = useState([{ id: 1, label: 'Shell 1' }]);
   const [activeTerminalTab, setActiveTerminalTab] = useState(1);
@@ -371,6 +372,13 @@ export default function SessionPage() {
     setShowQualityMenu(false);
   }, [ws]);
 
+  const applyCustomQuality = useCallback(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    setQualityPreset('manual');
+    ws.send(JSON.stringify({ type: 'quality_settings', payload: customQuality }));
+    setShowQualityMenu(false);
+  }, [ws, customQuality]);
+
   const addTerminalTab = useCallback(() => {
     const newId = nextTabId;
     setTerminalTabs(prev => [...prev, { id: newId, label: `Shell ${newId}` }]);
@@ -439,7 +447,7 @@ export default function SessionPage() {
             <button className={`rd-sidebar-btn ${showQualityMenu ? 'active' : ''}`}
               onClick={() => setShowQualityMenu(!showQualityMenu)}>
               <span className="rd-btn-icon">{I.sliders}</span>
-              <span className="rd-btn-label">Quality: {QUALITY_PRESETS[qualityPreset].label}</span>
+              <span className="rd-btn-label">Quality: {QUALITY_PRESETS[qualityPreset]?.label || 'Manual'}</span>
             </button>
             {showQualityMenu && (
               <div className="rd-quality-dropdown">
@@ -450,6 +458,15 @@ export default function SessionPage() {
                     <span className="rd-quality-detail">{preset.fps}fps · q{preset.quality}</span>
                   </button>
                 ))}
+                
+                <div style={{ padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px', borderTop: '1px solid rgba(255,255,255,0.1)', marginTop: '5px' }}>
+                   <span style={{ fontSize: '0.8rem', color: '#9ca3af', fontWeight: 'bold' }}>MANUAL CONFIG</span>
+                   <div style={{ display: 'flex', gap: '10px' }}>
+                      <input type="number" className="rd-settings-input" style={{ padding: '4px', fontSize: '0.8rem', minHeight: 'unset' }} title="FPS" placeholder="FPS" value={customQuality.fps} onChange={e=>setCustomQuality({...customQuality, fps: parseInt(e.target.value)||1})} />
+                      <input type="number" className="rd-settings-input" style={{ padding: '4px', fontSize: '0.8rem', minHeight: 'unset' }} title="Quality" placeholder="Quality%" value={customQuality.quality} onChange={e=>setCustomQuality({...customQuality, quality: parseInt(e.target.value)||1})} />
+                   </div>
+                   <button className="rd-settings-submit" style={{ padding: '5px', fontSize: '0.8rem' }} onClick={applyCustomQuality}>Apply Manual Settings</button>
+                </div>
               </div>
             )}
           </div>

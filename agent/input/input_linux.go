@@ -197,6 +197,10 @@ func (h *Handler) MouseScroll(x, y float64, deltaY float64) error {
 // TypeChar types a single character accurately using xdotool type
 // This handles all printable characters including shifted ones (?, !, @, etc.)
 func (h *Handler) TypeChar(char string) error {
+	// Space needs special handling — 'type' via stdin loses the space
+	if char == " " {
+		return runXdotool("key", "space")
+	}
 	return runXdotool("type", "--clearmodifiers", "--delay", "0", "--", char)
 }
 

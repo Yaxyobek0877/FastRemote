@@ -7,6 +7,8 @@ export default function TerminalPanel({ ws, isConnected, sessionId = 1, isVisibl
   const terminalRef = useRef(null);
   const termRef = useRef(null);
   const fitAddonRef = useRef(null);
+  const fitTimeoutRef = useRef(null);
+  const resizeObserverRef = useRef(null);
 
   const sendShellInput = useCallback((data) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -18,6 +20,20 @@ export default function TerminalPanel({ ws, isConnected, sessionId = 1, isVisibl
     ws.send(JSON.stringify({ type: 'shell_resize', payload: { cols, rows, sessionId: String(sessionId) } }));
   }, [ws, sessionId]);
 
+  // Debounced fit function to avoid excessive resizing
+  const debouncedFit = useCallback(() => {
+    if (fitTimeoutRef.current) clearTimeout(fitTimeoutRef.current);
+    fitTimeoutRef.current = setTimeout(() => {
+      if (fitAddonRef.current && termRef.current) {
+        try {
+          fitAddonRef.current.fit();
+        } catch(e) {
+          // Ignore fit errors during transitions
+        }
+      }
+    }, 50);
+  }, []);
+
   // Initialize terminal
   useEffect(() => {
     if (!terminalRef.current || termRef.current) return;
@@ -26,7 +42,7 @@ export default function TerminalPanel({ ws, isConnected, sessionId = 1, isVisibl
       cursorBlink: true,
       cursorStyle: 'bar',
       fontSize: 14,
-      fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', monospace",
       theme: {
         background: '#0a0e17',
         foreground: '#e2e8f0',
@@ -40,19 +56,30 @@ export default function TerminalPanel({ ws, isConnected, sessionId = 1, isVisibl
       lineHeight: 1.2,
       scrollback: 10000,
       allowProposedApi: true,
+      convertEol: true,
+      scrollOnUserInput: true,
     });
 
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
     term.open(terminalRef.current);
 
-    // Delay fit to ensure container has dimensions
-    setTimeout(() => {
-      try {
-        fitAddon.fit();
-        sendResize(term.cols, term.rows);
-      } catch(e) {}
-    }, 150);
+    // Multiple fit attempts to handle container dimension settling
+    const fitWithRetry = () => {
+      const attempts = [0, 100, 300, 600];
+      attempts.forEach(delay => {
+        setTimeout(() => {
+          try {
+            fitAddon.fit();
+            if (delay === attempts[attempts.length - 1]) {
+              sendResize(term.cols, term.rows);
+            }
+          } catch(e) {}
+        }, delay);
+      });
+    };
+
+    fitWithRetry();
 
     term.onData(sendShellInput);
     term.onResize(({ cols, rows }) => sendResize(cols, rows));
@@ -60,25 +87,40 @@ export default function TerminalPanel({ ws, isConnected, sessionId = 1, isVisibl
     termRef.current = term;
     fitAddonRef.current = fitAddon;
 
+    // ResizeObserver for responsive container changes
     const resizeObserver = new ResizeObserver(() => {
-      try { fitAddon.fit(); } catch(e) {}
+      debouncedFit();
     });
-    resizeObserver.observe(terminalRef.current);
+
+    if (terminalRef.current) {
+      resizeObserver.observe(terminalRef.current);
+    }
+    resizeObserverRef.current = resizeObserver;
+
+    // Also listen for window resize
+    const onWindowResize = () => debouncedFit();
+    window.addEventListener('resize', onWindowResize);
 
     return () => {
+      window.removeEventListener('resize', onWindowResize);
+      if (fitTimeoutRef.current) clearTimeout(fitTimeoutRef.current);
       resizeObserver.disconnect();
       term.dispose();
       termRef.current = null;
       fitAddonRef.current = null;
+      resizeObserverRef.current = null;
     };
-  }, [sendShellInput, sendResize]);
+  }, [sendShellInput, sendResize, debouncedFit]);
 
   // Refit when tab becomes visible
   useEffect(() => {
     if (isVisible && fitAddonRef.current) {
-      setTimeout(() => {
-        try { fitAddonRef.current.fit(); } catch(e) {}
-      }, 50);
+      // Multiple attempts for tab switch transitions
+      [0, 50, 150].forEach(delay => {
+        setTimeout(() => {
+          try { fitAddonRef.current?.fit(); } catch(e) {}
+        }, delay);
+      });
     }
   }, [isVisible]);
 
