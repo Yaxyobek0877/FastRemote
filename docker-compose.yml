@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: ./server
+      dockerfile: ../Dockerfile.server
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - JWT_SECRET=fastremote-jwt-secret-change-in-production
+      - AGENT_KEY=fastremote-agent-key-change-me
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: ../Dockerfile.web
+    ports:
+      - "5173:80"
+    depends_on:
+      - server
+    restart: unless-stopped
