@@ -461,9 +461,6 @@ export default function ScreenViewer({ ws, isConnected }) {
     );
   }
 
-  // Pick cursor shape based on cursorType from server
-  const cursorSVG = CURSOR_SHAPES[cursorType] || CURSOR_SHAPES.default;
-
   return (
     <div className="screen-viewer" ref={containerRef} onClick={handleContainerClick}>
       <div className="screen-canvas-wrapper" style={{ position: 'relative' }}>
@@ -484,13 +481,8 @@ export default function ScreenViewer({ ws, isConnected }) {
           tabIndex={0}
           id="screen-canvas"
         />
-
-        {/* Cursor overlay — local position (instant) + server cursor type */}
-        {isFocused && (
-          <div ref={cursorRef} className="local-cursor">
-            {cursorSVG}
-          </div>
-        )}
+        {/* Lokal SVG kursor olib tashlandi — qurilmaning haqiqiy kursori
+            H.264 video ichida (-draw_mouse) allaqachon ko'rinadi */}
       </div>
 
       {/* Stats overlay */}

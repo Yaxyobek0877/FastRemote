@@ -980,7 +980,7 @@ body {
   display: block;
   max-width: 100%;
   max-height: 100vh;
-  cursor: crosshair;
+  cursor: none; /* faqat qurilmaning haqiqiy kursori (video ichida) ko'rinadi */
   image-rendering: -webkit-optimize-contrast;
   outline: none;
   transition: box-shadow 0.2s ease;
