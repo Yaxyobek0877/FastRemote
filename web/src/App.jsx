@@ -17,9 +17,17 @@ function App() {
       <Routes>
         <Route path="/login" element={<LoginPage />} />
 
-        {/* Main Dashboard (Session Page) — sidebar ichida "Bosh sahifa" bo'limi bor */}
+        {/* Dashboard — har bir sidebar bo'limi alohida URL (/, /screen, /terminal, /files, /settings) */}
         <Route
           path="/"
+          element={
+            <ProtectedRoute>
+              <SessionPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/:panel"
           element={
             <ProtectedRoute>
               <SessionPage />

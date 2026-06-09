@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
 import { createSessionSocket, getUsername, logout, getSettings, updateSettings, changePassword as apiChangePassword, addUser as apiAddUser, deleteUser as apiDeleteUser, resetUserPassword as apiResetPassword, getServerInfo, getDeviceInfo, formatBytes } from '../utils/api';
+
+const PANELS = ['home', 'screen', 'terminal', 'files', 'settings'];
 import ScreenViewer from '../components/ScreenViewer';
 import TerminalPanel from '../components/TerminalPanel';
 import FileTransferPanel from '../components/FileTransferPanel';
@@ -33,6 +36,8 @@ const I = {
   home: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>,
   cpu: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>,
   globe: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>,
+  gpu: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 18v2M18 18v2"/><circle cx="8.5" cy="12" r="2"/><circle cx="15.5" cy="12" r="2"/></svg>,
+  disk: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>,
 };
 
 // soniyalarni "2d 4h 13m" ko'rinishiga o'tkazadi (device uptime uchun)
@@ -341,9 +346,12 @@ function HomePanel({ connectionStatus, sessionUptime }) {
   }, []);
 
   const online = connectionStatus === 'connected' && !err;
+  const disks = info?.disks || [];
+  const gpus = info?.gpus || [];
   const meta = [
     { label: 'Operatsion tizim', icon: I.server, value: info ? `${info.os} (${info.arch})` : '—' },
     { label: 'Protsessor yadrolari', icon: I.cpu, value: info ? `${info.cpuCores} ta` : '—' },
+    ...(gpus.length ? [{ label: 'Grafik protsessor (GPU)', icon: I.gpu, value: gpus.map(g => g.name).join(', ') }] : []),
     { label: "Ekran o'lchami", icon: I.screen, value: info?.screenWidth ? `${info.screenWidth} × ${info.screenHeight}` : '—' },
     { label: 'IP manzil', icon: I.globe, value: info?.ip || '—' },
     { label: 'Ishlash vaqti', icon: I.clock, value: formatSeconds(info?.uptimeSeconds) },
@@ -382,8 +390,25 @@ function HomePanel({ connectionStatus, sessionUptime }) {
               detail={`${info.cpuCores} yadro`} />
             <UsageGauge icon={I.server} label="Operativ xotira (RAM)" percent={info.memUsedPercent}
               detail={`${formatBytes(info.memUsed)} / ${formatBytes(info.memTotal)}`} />
-            <UsageGauge icon={I.folder} label="Disk (/)" percent={info.diskUsedPercent}
-              detail={`${formatBytes(info.diskUsed)} / ${formatBytes(info.diskTotal)}`} />
+
+            {/* GPU yuklamasi (mavjud bo'lsa) */}
+            {gpus.filter(g => g.hasUtil).map((g, i) => (
+              <UsageGauge key={`gu${i}`} icon={I.gpu}
+                label={`GPU${gpus.length > 1 ? ` ${i + 1}` : ''} yuklamasi`}
+                percent={g.utilPercent} detail={g.name} />
+            ))}
+            {/* GPU xotirasi (NVIDIA) */}
+            {gpus.filter(g => g.hasUtil && g.memTotal > 0).map((g, i) => (
+              <UsageGauge key={`gm${i}`} icon={I.gpu}
+                label={`GPU${gpus.length > 1 ? ` ${i + 1}` : ''} xotira`}
+                percent={g.memPercent} detail={`${formatBytes(g.memUsed)} / ${formatBytes(g.memTotal)}`} />
+            ))}
+
+            {/* Har bir disk */}
+            {disks.map((d, i) => (
+              <UsageGauge key={`d${i}`} icon={I.disk} label={`Disk ${d.mount}`}
+                percent={d.percent} detail={`${formatBytes(d.used)} / ${formatBytes(d.total)}`} />
+            ))}
           </div>
         </div>
       )}
@@ -409,7 +434,13 @@ function HomePanel({ connectionStatus, sessionUptime }) {
 
 // ====================== MAIN SESSION PAGE ======================
 export default function SessionPage() {
-  const [activePanel, setActivePanel] = useState(() => localStorage.getItem('rd_panel') || 'home');
+  // Faol panel URL'dan olinadi — har bo'lim alohida manzilga ega (/, /screen, ...)
+  const { panel } = useParams();
+  const navigate = useNavigate();
+  const activePanel = PANELS.includes(panel) ? panel : 'home';
+  const setActivePanel = useCallback((id) => {
+    navigate(id === 'home' ? '/' : `/${id}`);
+  }, [navigate]);
   const [ws, setWs] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
@@ -432,8 +463,7 @@ export default function SessionPage() {
     return () => clearInterval(t);
   }, [sessionStart]);
 
-  // Persist state
-  useEffect(() => { localStorage.setItem('rd_panel', activePanel); }, [activePanel]);
+  // Persist sidebar holati (faol panel endi URL'da saqlanadi)
   useEffect(() => { localStorage.setItem('rd_sidebar', sidebarOpen ? 'open' : 'closed'); }, [sidebarOpen]);
 
   // WebSocket with exponential backoff reconnect

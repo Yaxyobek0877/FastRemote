@@ -346,14 +346,13 @@ func handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 		"uptimeSeconds":   int64(uptime.Seconds()),
 		"version":         appVersion,
 		"serverTime":      time.Now().Format(time.RFC3339),
-		"cpuPercent":      stats.CPUPercent,
-		"memUsed":         stats.MemUsed,
-		"memTotal":        stats.MemTotal,
-		"memUsedPercent":  stats.MemUsedPercent,
-		"diskUsed":        stats.DiskUsed,
-		"diskTotal":       stats.DiskTotal,
-		"diskUsedPercent": stats.DiskUsedPercent,
-		"statsSupported":  stats.Supported,
+		"cpuPercent":     stats.CPUPercent,
+		"memUsed":        stats.MemUsed,
+		"memTotal":       stats.MemTotal,
+		"memUsedPercent": stats.MemUsedPercent,
+		"disks":          stats.Disks,
+		"gpus":           stats.GPUs,
+		"statsSupported": stats.Supported,
 	})
 }
 

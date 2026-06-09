@@ -2263,7 +2263,7 @@ select.rd-settings-input {
 /* ============================================================
    HOME PANEL — professional (resurslar + qurilma ma'lumotlari)
    ============================================================ */
-.hp-page { max-width: 1100px; }
+.hp-page { max-width: 1320px; margin-left: auto; margin-right: auto; }
 
 /* Hero — qurilma sarlavhasi */
 .hp-hero {
@@ -2295,8 +2295,8 @@ select.rd-settings-input {
 /* Resurs gauge'lari */
 .hp-usage-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px 28px;
   margin-top: 4px;
 }
 .hp-usage { display: flex; flex-direction: column; gap: 8px; }
@@ -2329,7 +2329,7 @@ select.rd-settings-input {
 /* Qurilma ma'lumotlari */
 .hp-meta-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 12px;
   margin-top: 4px;
 }
@@ -2363,11 +2363,9 @@ select.rd-settings-input {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-@media (max-width: 900px) {
-  .hp-usage-grid { grid-template-columns: 1fr; }
-  .hp-meta-grid { grid-template-columns: 1fr 1fr; }
-}
 @media (max-width: 560px) {
+  .hp-hero { flex-direction: column; align-items: flex-start; }
+  .hp-usage-grid { grid-template-columns: 1fr; }
   .hp-meta-grid { grid-template-columns: 1fr; }
 }
 
