@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -105,10 +106,15 @@ type wsMsg struct {
 }
 
 type Viewer struct {
-	FrameChan chan []byte  // video frames (high priority)
+	FrameChan chan []byte  // JPEG frames (zaxira yo'l)
+	VideoChan chan []byte  // H264 access unitlar (asosiy past-kechikish yo'l)
 	JsonChan  chan wsMsg   // JSON messages (cursor, shell output, etc.)
 	WriteMu   *sync.Mutex // fallback mutex for direct writes (pre-registration)
 	Done      chan struct{}
+
+	videoActive   atomic.Bool   // H264 oqimi yoqilganmi (yoqilsa JPEG yuborilmaydi)
+	videoMu       sync.Mutex    // videoStreamer ni himoyalaydi
+	videoStreamer *h264Streamer // joriy ffmpeg H264 oqimi
 }
 
 var (
@@ -537,8 +543,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hostname string) {
 
 	// Register viewer
 	v := &Viewer{
-		FrameChan: make(chan []byte, 3),  // video frames (high priority)
-		JsonChan:  make(chan wsMsg, 30),  // JSON messages (lower priority)
+		FrameChan: make(chan []byte, 3),    // JPEG frames (zaxira)
+		VideoChan: make(chan []byte, 256),  // H264 access unitlar (asosiy)
+		JsonChan:  make(chan wsMsg, 30),    // JSON messages (lower priority)
 		WriteMu:   &sync.Mutex{},
 		Done:      make(chan struct{}),
 	}
@@ -557,7 +564,21 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hostname string) {
 			}
 		}()
 		for {
-			// Priority 1: always try to send a frame first
+			// Priority 0: H264 video access unitlar (eng yuqori — kechikish minimal)
+			select {
+			case vf, ok := <-viewer.VideoChan:
+				if !ok {
+					return
+				}
+				c.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if err := c.WriteMessage(websocket.BinaryMessage, vf); err != nil {
+					return
+				}
+				continue
+			default:
+			}
+
+			// Priority 1: JPEG frame (zaxira yo'l)
 			select {
 			case frame, ok := <-viewer.FrameChan:
 				if !ok {
@@ -571,8 +592,16 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hostname string) {
 			default:
 			}
 
-			// Priority 2: no frame pending — wait for either frame or JSON
+			// Priority 2: nothing pending — wait for any
 			select {
+			case vf, ok := <-viewer.VideoChan:
+				if !ok {
+					return
+				}
+				c.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				if err := c.WriteMessage(websocket.BinaryMessage, vf); err != nil {
+					return
+				}
 			case frame, ok := <-viewer.FrameChan:
 				if !ok {
 					return
@@ -647,8 +676,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hostname string) {
 	viewersMu.Lock()
 	if v, ok := directViewers[conn]; ok {
 		delete(directViewers, conn)
+		v.videoMu.Lock()
+		if v.videoStreamer != nil {
+			v.videoStreamer.close() // ffmpeg H264 oqimini to'xtat
+			v.videoStreamer = nil
+		}
+		v.videoMu.Unlock()
 		close(v.Done)      // Signal the priority writer to stop
 		close(v.FrameChan) // Stop frame delivery
+		close(v.VideoChan) // Stop H264 delivery
 		close(v.JsonChan)  // Stop JSON delivery
 	}
 	viewerCount = len(directViewers)
@@ -736,8 +772,82 @@ func handleViewerMessage(msg WSMessage, viewerConn *websocket.Conn, fileHandler 
 	case "audio_stop":
 		handleAudioStop()
 
+	case "video_start":
+		var req struct {
+			Width   int `json:"width"`
+			Height  int `json:"height"`
+			FPS     int `json:"fps"`
+			Bitrate int `json:"bitrate"`
+		}
+		_ = json.Unmarshal(msg.Payload, &req)
+		startViewerVideo(viewerConn, req.Width, req.Height, req.FPS, req.Bitrate)
+
+	case "video_stop":
+		stopViewerVideo(viewerConn)
+
 	default:
 		log.Printf("[WS] Unknown message type: %s", msg.Type)
+	}
+}
+
+// startViewerVideo — viewer uchun H264 oqimini (ffmpeg) boshlaydi va NAL'larni
+// 'H' prefiks + keyframe bayrog'i bilan VideoChan orqali yuboradi.
+func startViewerVideo(conn *websocket.Conn, width, height, fps, bitrate int) {
+	viewersMu.RLock()
+	v := directViewers[conn]
+	viewersMu.RUnlock()
+	if v == nil {
+		return
+	}
+	if width <= 0 {
+		width = capturer.ActualWidth
+	}
+	if height <= 0 {
+		height = capturer.ActualHeight
+	}
+	if fps <= 0 {
+		fps = 30
+	}
+	if bitrate <= 0 {
+		bitrate = 8000
+	}
+
+	v.videoMu.Lock()
+	defer v.videoMu.Unlock()
+	if v.videoStreamer != nil {
+		v.videoStreamer.close()
+		v.videoStreamer = nil
+	}
+	v.videoActive.Store(true)
+	v.videoStreamer = startH264Stream(width, height, fps, bitrate, func(au []byte, key bool) {
+		msg := make([]byte, 2+len(au))
+		msg[0] = 'H' // H264 marker (JPEG=0xFF, Audio='A')
+		if key {
+			msg[1] = 1
+		}
+		copy(msg[2:], au)
+		select {
+		case v.VideoChan <- msg:
+		default: // buffer to'la — tashlab yuboramiz (keyingi keyframe'da tiklanadi)
+		}
+	})
+	log.Printf("[H264] viewer uchun video boshlandi: %dx%d@%d %dk", width, height, fps, bitrate)
+}
+
+// stopViewerVideo — H264 oqimini to'xtatib, JPEG zaxirasiga qaytaradi.
+func stopViewerVideo(conn *websocket.Conn) {
+	viewersMu.RLock()
+	v := directViewers[conn]
+	viewersMu.RUnlock()
+	if v == nil {
+		return
+	}
+	v.videoMu.Lock()
+	defer v.videoMu.Unlock()
+	v.videoActive.Store(false)
+	if v.videoStreamer != nil {
+		v.videoStreamer.close()
+		v.videoStreamer = nil
 	}
 }
 
@@ -750,6 +860,9 @@ func frameDistributor() {
 		// Send to all viewers with "latest frame swap" — drain stale, push fresh
 		viewersMu.RLock()
 		for _, v := range directViewers {
+			if v.videoActive.Load() {
+				continue // H264 oqimida — JPEG yuborilmaydi
+			}
 			// Drain any stale frame first
 			select {
 			case <-v.FrameChan:

@@ -1,5 +1,4 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { createWebRTCSession } from '../utils/webrtcClient';
 
 // Cursor SVG paths by type
 const CURSOR_SHAPES = {
@@ -51,12 +50,12 @@ const CURSOR_SHAPES = {
 
 export default function ScreenViewer({ ws, isConnected }) {
   const canvasRef = useRef(null);
-  const videoRef = useRef(null);
   const containerRef = useRef(null);
   const cursorRef = useRef(null);
-  const rtcRef = useRef(null);
-  const [rtcState, setRtcState] = useState('idle');
-  const [useWebRTC, setUseWebRTC] = useState(true);
+  // H.264 (WebCodecs) past-kechikish yo'li; qo'llab-quvvatlanmasa JPEG zaxirasi
+  const [mode, setMode] = useState(() => (typeof window !== 'undefined' && 'VideoDecoder' in window ? 'h264' : 'jpeg'));
+  const decoderRef = useRef(null);
+  const gotKeyRef = useRef(false);
   const [fps, setFps] = useState(0);
   const [resolution, setResolution] = useState('');
   const [isFocused, setIsFocused] = useState(false);
@@ -85,18 +84,38 @@ export default function ScreenViewer({ ws, isConnected }) {
   // FRAME HANDLER
   // ==========================================
   const handleFrame = useCallback((data) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    // Audio check
     const view = new Uint8Array(data);
+
+    // Audio (prefix 'A')
     if (view[0] === 0x41) {
       handleAudioChunk(data.slice(1));
       return;
     }
 
-    // Skip JPEG decoding if WebRTC is delivering video
-    if (rtcState === 'connected') return;
+    // H.264 access unit (prefix 'H') — asosiy past-kechikish yo'li
+    if (view[0] === 0x48) {
+      const dec = decoderRef.current;
+      if (!dec || dec.state !== 'configured') return;
+      const isKey = view[1] === 1;
+      if (!gotKeyRef.current) {
+        if (!isKey) return; // birinchi keyframe'ni kutamiz
+        gotKeyRef.current = true;
+      }
+      try {
+        dec.decode(new EncodedVideoChunk({
+          type: isKey ? 'key' : 'delta',
+          timestamp: performance.now() * 1000,
+          data: data.slice(2), // 'H' + keyframe bayrog'ini olib tashlaymiz
+        }));
+      } catch (e) {
+        gotKeyRef.current = false; // keyingi keyframe'dan qayta boshlaymiz
+      }
+      return;
+    }
+
+    // JPEG (zaxira yo'l)
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
     // Drop if still decoding — but with safety timeout
     if (isDecodingRef.current) return;
@@ -365,24 +384,63 @@ export default function ScreenViewer({ ws, isConnected }) {
 
   useEffect(() => { if (isConnected && canvasRef.current) canvasRef.current.focus(); }, [isConnected]);
 
-  // WebRTC lifecycle
+  // H.264 (WebCodecs) lifecycle — past-kechikish, tunnel orqali ham ishlaydi
   useEffect(() => {
-    if (!isConnected || !useWebRTC) return;
-    setRtcState('connecting');
-    const sess = createWebRTCSession({
-      videoEl: videoRef.current,
-      width: 1280,
-      height: 720,
-      fps: 30,
-      bitrate: 2000,
-      onState: (st) => setRtcState(st),
-    });
-    rtcRef.current = sess;
-    return () => {
-      try { sess.close(); } catch {}
-      rtcRef.current = null;
+    if (!isConnected || !ws || mode !== 'h264') return;
+    if (!('VideoDecoder' in window)) { setMode('jpeg'); return; }
+
+    let decoder;
+    try {
+      decoder = new VideoDecoder({
+        output: (frame) => {
+          const canvas = canvasRef.current;
+          if (canvas) {
+            if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+              canvas.width = frame.displayWidth;
+              canvas.height = frame.displayHeight;
+              setResolution(`${frame.displayWidth}×${frame.displayHeight}`);
+            }
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(frame, 0, 0);
+            // FPS hisoblash
+            frameCountRef.current++;
+            const now = Date.now();
+            if (now - lastFpsTimeRef.current >= 1000) {
+              setFps(frameCountRef.current);
+              frameCountRef.current = 0;
+              lastFpsTimeRef.current = now;
+            }
+          }
+          frame.close();
+        },
+        error: (e) => { console.error('[H264] decoder error:', e); },
+      });
+      decoder.configure({ codec: 'avc1.42E01F', optimizeForLatency: true });
+    } catch (e) {
+      console.error('[H264] init failed, JPEG zaxirasiga o\'tildi:', e);
+      setMode('jpeg');
+      return;
+    }
+    decoderRef.current = decoder;
+    gotKeyRef.current = false;
+
+    const startVideo = () => {
+      if (ws.readyState === WebSocket.OPEN) {
+        // width/height=0 → agent native ekran o'lchamini ishlatadi
+        ws.send(JSON.stringify({ type: 'video_start', payload: { width: 0, height: 0, fps: 30, bitrate: 10000 } }));
+      }
     };
-  }, [isConnected, useWebRTC]);
+    if (ws.readyState === WebSocket.OPEN) startVideo();
+    else ws.addEventListener('open', startVideo, { once: true });
+
+    return () => {
+      try { ws.removeEventListener('open', startVideo); } catch {}
+      try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'video_stop' })); } catch {}
+      try { decoder.close(); } catch {}
+      decoderRef.current = null;
+      gotKeyRef.current = false;
+    };
+  }, [isConnected, ws, mode]);
   useEffect(() => {
     const fn = () => { setTimeout(() => { if (canvasRef.current) canvasRef.current.focus(); }, 100); };
     document.addEventListener('fullscreenchange', fn);
@@ -409,31 +467,10 @@ export default function ScreenViewer({ ws, isConnected }) {
   return (
     <div className="screen-viewer" ref={containerRef} onClick={handleContainerClick}>
       <div className="screen-canvas-wrapper" style={{ position: 'relative' }}>
-        {useWebRTC && (
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            onLoadedMetadata={(e) => {
-              const v = e.target;
-              if (canvasRef.current && v.videoWidth) {
-                canvasRef.current.width = v.videoWidth;
-                canvasRef.current.height = v.videoHeight;
-                setResolution(`${v.videoWidth}×${v.videoHeight}`);
-              }
-            }}
-            style={{
-              position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
-              objectFit: 'contain', pointerEvents: 'none', zIndex: 1,
-              display: rtcState === 'connected' ? 'block' : 'none',
-            }}
-          />
-        )}
         <canvas
           ref={canvasRef}
           className={`screen-canvas ${isFocused ? 'focused' : ''}`}
-          style={{ position: 'relative', zIndex: 2, background: 'transparent' }}
+          style={{ position: 'relative', zIndex: 2, background: '#000' }}
           onMouseMove={handleMouseMove}
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}
@@ -458,6 +495,7 @@ export default function ScreenViewer({ ws, isConnected }) {
 
       {/* Stats overlay */}
       <div className="screen-overlay">
+        <div className="screen-info">{mode === 'h264' ? 'H.264' : 'JPEG'}</div>
         <div className="screen-info">{resolution}</div>
         <div className="screen-info">{fps} FPS</div>
         <div className="screen-info">{frameSize} KB/s</div>
