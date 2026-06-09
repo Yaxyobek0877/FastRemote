@@ -1,5 +1,6 @@
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { isAuthenticated } from './utils/api';
+import HomePage from './pages/HomePage';
 import LoginPage from './pages/LoginPage';
 import SessionPage from './pages/SessionPage';
 
@@ -15,16 +16,19 @@ function App() {
   return (
     <Router>
       <Routes>
+        {/* Default home page — qurilma holati (public) */}
+        <Route path="/" element={<HomePage />} />
+
         <Route path="/login" element={<LoginPage />} />
-        
-        {/* Main Dashboard (Session Page) */}
-        <Route 
-          path="/" 
+
+        {/* Main Dashboard (Session Page) — login'dan keyin */}
+        <Route
+          path="/devices"
           element={
             <ProtectedRoute>
               <SessionPage />
             </ProtectedRoute>
-          } 
+          }
         />
 
         {/* Catch all */}

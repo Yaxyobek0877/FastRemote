@@ -1,6 +1,12 @@
 # Go build artifacts
 /agent/fastremote-agent
 /agent/agent
+/server/fastremote-server
+/server/server
+# Compiled binaries (any OS, incl. Windows .exe)
+*.exe
+fastremote-agent
+fastremote-server
 
 # Go test / coverage
 *.out

@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
+import { createWebRTCSession } from '../utils/webrtcClient';
 
 // Cursor SVG paths by type
 const CURSOR_SHAPES = {
@@ -50,8 +51,12 @@ const CURSOR_SHAPES = {
 
 export default function ScreenViewer({ ws, isConnected }) {
   const canvasRef = useRef(null);
+  const videoRef = useRef(null);
   const containerRef = useRef(null);
   const cursorRef = useRef(null);
+  const rtcRef = useRef(null);
+  const [rtcState, setRtcState] = useState('idle');
+  const [useWebRTC, setUseWebRTC] = useState(true);
   const [fps, setFps] = useState(0);
   const [resolution, setResolution] = useState('');
   const [isFocused, setIsFocused] = useState(false);
@@ -89,6 +94,9 @@ export default function ScreenViewer({ ws, isConnected }) {
       handleAudioChunk(data.slice(1));
       return;
     }
+
+    // Skip JPEG decoding if WebRTC is delivering video
+    if (rtcState === 'connected') return;
 
     // Drop if still decoding — but with safety timeout
     if (isDecodingRef.current) return;
@@ -271,6 +279,7 @@ export default function ScreenViewer({ ws, isConnected }) {
       deltaY: e.deltaY || 0,
     };
 
+    if (action !== 'move') console.log('[mouse→agent]', action, payload.button, payload.x.toFixed(3), payload.y.toFixed(3));
     ws.send(JSON.stringify({ type: 'mouse_event', payload }));
   }, [ws]);
 
@@ -294,19 +303,19 @@ export default function ScreenViewer({ ws, isConnected }) {
   const handleClick = useCallback((e) => {
     if (canvasRef.current) canvasRef.current.focus();
     updateLocalCursor(e);
-    sendMouseEvent(e, 'click');
-  }, [updateLocalCursor, sendMouseEvent]);
+    // NOTE: don't send 'click' — mousedown+mouseup already performed the click on the server
+  }, [updateLocalCursor]);
 
   const handleDblClick = useCallback((e) => {
     updateLocalCursor(e);
-    sendMouseEvent(e, 'dblclick');
-  }, [updateLocalCursor, sendMouseEvent]);
+    // NOTE: two down+up pairs already arrived on the server; sending 'dblclick' would add a third click
+  }, [updateLocalCursor]);
 
   const handleContextMenu = useCallback((e) => {
     e.preventDefault();
     updateLocalCursor(e);
-    sendMouseEvent(e, 'click');
-  }, [updateLocalCursor, sendMouseEvent]);
+    // NOTE: right-button mousedown+mouseup already sent; no extra click needed
+  }, [updateLocalCursor]);
 
   const lastScrollSend = useRef(0);
   const handleWheel = useCallback((e) => {
@@ -355,6 +364,25 @@ export default function ScreenViewer({ ws, isConnected }) {
   }, [ws, isConnected, isFocused]);
 
   useEffect(() => { if (isConnected && canvasRef.current) canvasRef.current.focus(); }, [isConnected]);
+
+  // WebRTC lifecycle
+  useEffect(() => {
+    if (!isConnected || !useWebRTC) return;
+    setRtcState('connecting');
+    const sess = createWebRTCSession({
+      videoEl: videoRef.current,
+      width: 1280,
+      height: 720,
+      fps: 30,
+      bitrate: 2000,
+      onState: (st) => setRtcState(st),
+    });
+    rtcRef.current = sess;
+    return () => {
+      try { sess.close(); } catch {}
+      rtcRef.current = null;
+    };
+  }, [isConnected, useWebRTC]);
   useEffect(() => {
     const fn = () => { setTimeout(() => { if (canvasRef.current) canvasRef.current.focus(); }, 100); };
     document.addEventListener('fullscreenchange', fn);
@@ -380,10 +408,32 @@ export default function ScreenViewer({ ws, isConnected }) {
 
   return (
     <div className="screen-viewer" ref={containerRef} onClick={handleContainerClick}>
-      <div className="screen-canvas-wrapper">
+      <div className="screen-canvas-wrapper" style={{ position: 'relative' }}>
+        {useWebRTC && (
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            onLoadedMetadata={(e) => {
+              const v = e.target;
+              if (canvasRef.current && v.videoWidth) {
+                canvasRef.current.width = v.videoWidth;
+                canvasRef.current.height = v.videoHeight;
+                setResolution(`${v.videoWidth}×${v.videoHeight}`);
+              }
+            }}
+            style={{
+              position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+              objectFit: 'contain', pointerEvents: 'none', zIndex: 1,
+              display: rtcState === 'connected' ? 'block' : 'none',
+            }}
+          />
+        )}
         <canvas
           ref={canvasRef}
           className={`screen-canvas ${isFocused ? 'focused' : ''}`}
+          style={{ position: 'relative', zIndex: 2, background: 'transparent' }}
           onMouseMove={handleMouseMove}
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}

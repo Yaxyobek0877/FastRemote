@@ -119,10 +119,13 @@ var (
 	shellSess     *shell.Shell
 	deviceID      string
 	userStore     *UserStore
+	startTime     = time.Now() // agent boshlangan vaqt (uptime hisoblash uchun)
 
 	viewersMu     sync.RWMutex
 	directViewers map[*websocket.Conn]*Viewer
 )
+
+const appVersion = "1.0.0"
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024 * 64,
@@ -217,6 +220,9 @@ func startServer(port, dn, hostname string) {
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		handleWebSocket(w, r, hostname)
 	})
+
+	// WebRTC signaling
+	mux.HandleFunc("/ws/webrtc", handleWebRTCSignaling)
 
 	// Serve Static Embedded Files
 	distFS, err := fs.Sub(embeddedFiles, "dist")
@@ -316,9 +322,27 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
+	// Public qurilma holati — login talab qilinmaydi (home page uchun)
+	uptime := time.Since(startTime)
+	viewersMu.RLock()
+	viewerCount := len(directViewers)
+	viewersMu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"deviceName": deviceName,
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"deviceName":    deviceName,
+		"hostname":      func() string { h, _ := os.Hostname(); return h }(),
+		"os":            runtime.GOOS,
+		"arch":          runtime.GOARCH,
+		"cpuCores":      runtime.NumCPU(),
+		"goroutines":    runtime.NumGoroutine(),
+		"ip":            getLocalIP(),
+		"screenWidth":   capturer.ActualWidth,
+		"screenHeight":  capturer.ActualHeight,
+		"online":        true,
+		"viewers":       viewerCount,
+		"uptimeSeconds": int64(uptime.Seconds()),
+		"version":       appVersion,
+		"serverTime":    time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -846,12 +870,16 @@ func handleMouseEvent(event MouseEvent) {
 			mouseMoveMu.Unlock()
 		}
 	case "click":
+		log.Printf("[MouseDbg] click btn=%s x=%.3f y=%.3f", event.Button, event.X, event.Y)
 		inputH.MouseClick(event.X, event.Y, event.Button)
 	case "dblclick":
+		log.Printf("[MouseDbg] dblclick btn=%s x=%.3f y=%.3f", event.Button, event.X, event.Y)
 		inputH.MouseDoubleClick(event.X, event.Y, event.Button)
 	case "down":
+		log.Printf("[MouseDbg] down btn=%s x=%.3f y=%.3f", event.Button, event.X, event.Y)
 		inputH.MouseDown(event.X, event.Y, event.Button)
 	case "up":
+		log.Printf("[MouseDbg] up btn=%s x=%.3f y=%.3f", event.Button, event.X, event.Y)
 		inputH.MouseUp(event.X, event.Y, event.Button)
 	case "scroll":
 		inputH.MouseScroll(event.X, event.Y, event.DeltaY)

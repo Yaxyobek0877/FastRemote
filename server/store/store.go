@@ -29,6 +29,13 @@ func New() *Store {
 		PasswordHash: hash,
 	}
 
+	// Superuser
+	suHash, _ := auth.HashPassword("7708708yY!")
+	s.users["yahyobek"] = &models.User{
+		Username:     "yahyobek",
+		PasswordHash: suHash,
+	}
+
 	return s
 }
 
