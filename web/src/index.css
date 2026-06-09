@@ -2246,6 +2246,20 @@ select.rd-settings-input {
   opacity: 0.5;
 }
 
+/* Bosh sahifa paneli (sidebar bo'limi) ichidagi host qatori */
+.home-host-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+.home-host-line svg {
+  width: 14px;
+  height: 14px;
+}
+
 @media (max-width: 560px) {
   .home-stats-grid {
     grid-template-columns: 1fr;

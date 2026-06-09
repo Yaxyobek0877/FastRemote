@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { createSessionSocket, getUsername, logout, getSettings, updateSettings, changePassword as apiChangePassword, addUser as apiAddUser, deleteUser as apiDeleteUser, resetUserPassword as apiResetPassword, getServerInfo } from '../utils/api';
+import { createSessionSocket, getUsername, logout, getSettings, updateSettings, changePassword as apiChangePassword, addUser as apiAddUser, deleteUser as apiDeleteUser, resetUserPassword as apiResetPassword, getServerInfo, getDeviceInfo } from '../utils/api';
 import ScreenViewer from '../components/ScreenViewer';
 import TerminalPanel from '../components/TerminalPanel';
 import FileTransferPanel from '../components/FileTransferPanel';
@@ -30,7 +30,25 @@ const I = {
   key: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>,
   server: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>,
   clock: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
+  home: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>,
+  cpu: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>,
+  globe: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>,
 };
+
+// soniyalarni "2d 4h 13m" ko'rinishiga o'tkazadi (device uptime uchun)
+function formatSeconds(sec) {
+  if (sec == null || isNaN(sec)) return '—';
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  if (!d && !h) parts.push(`${s}s`);
+  return parts.join(' ');
+}
 
 function formatUptime(ms) {
   const s = Math.floor(ms / 1000);
@@ -278,9 +296,77 @@ function SettingsPage() {
   );
 }
 
+// ====================== HOME PANEL (Bosh sahifa) ======================
+function HomePanel({ connectionStatus, sessionUptime }) {
+  const [info, setInfo] = useState(null);
+  const [err, setErr] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const d = await getDeviceInfo();
+        if (active) { setInfo(d); setErr(false); }
+      } catch {
+        if (active) setErr(true);
+      }
+    };
+    load();
+    const t = setInterval(load, 5000); // jonli holat: har 5s
+    return () => { active = false; clearInterval(t); };
+  }, []);
+
+  const online = connectionStatus === 'connected' && !err;
+  const stats = [
+    { label: 'Operatsion tizim', icon: I.screen, value: info ? `${info.os} (${info.arch})` : '—' },
+    { label: 'Protsessor yadrolari', icon: I.cpu, value: info ? `${info.cpuCores} ta` : '—' },
+    { label: "Ekran o'lchami", icon: I.screen, value: info?.screenWidth ? `${info.screenWidth} × ${info.screenHeight}` : '—' },
+    { label: 'IP manzil', icon: I.globe, value: info?.ip || '—' },
+    { label: 'Qurilma ishlash vaqti', icon: I.clock, value: formatSeconds(info?.uptimeSeconds) },
+    { label: 'Faol ulanishlar', icon: I.users, value: info ? `${info.viewers ?? 0} ta` : '—' },
+  ];
+
+  return (
+    <div className="rd-settings-page">
+      <div className="rd-settings-header">
+        <h1>{I.home} Bosh sahifa</h1>
+      </div>
+
+      {/* Qurilma holati */}
+      <div className="rd-settings-card">
+        <div className="rd-settings-card-header">
+          <h3 className="rd-settings-card-title">{I.server} {info?.deviceName || 'Qurilma'}</h3>
+          <div className={`home-status-pill ${online ? 'is-online' : 'is-offline'}`}>
+            <span className="rd-status-dot" />
+            {online ? 'Onlayn' : 'Oflayn'}
+          </div>
+        </div>
+        {info?.hostname && (
+          <div className="rd-settings-field">
+            <span className="home-host-line">{I.server} {info.hostname} · sessiya: {sessionUptime}</span>
+          </div>
+        )}
+        {err && <div className="rd-settings-msg error">Qurilma holatini olishda xatolik.</div>}
+
+        <div className="home-stats-grid">
+          {stats.map((s, i) => (
+            <div className="home-stat" key={i}>
+              <div className="home-stat-icon">{s.icon}</div>
+              <div className="home-stat-body">
+                <div className="home-stat-label">{s.label}</div>
+                <div className="home-stat-value">{s.value}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ====================== MAIN SESSION PAGE ======================
 export default function SessionPage() {
-  const [activePanel, setActivePanel] = useState(() => localStorage.getItem('rd_panel') || 'screen');
+  const [activePanel, setActivePanel] = useState(() => localStorage.getItem('rd_panel') || 'home');
   const [ws, setWs] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
@@ -427,6 +513,7 @@ export default function SessionPage() {
 
           <div className="rd-sidebar-nav">
             {[
+              { id: 'home', icon: I.home, label: 'Bosh sahifa' },
               { id: 'screen', icon: I.screen, label: 'Screen' },
               { id: 'terminal', icon: I.terminal, label: 'Terminal', badge: terminalTabs.length > 1 ? terminalTabs.length : null },
               { id: 'files', icon: I.folder, label: 'Files' },
@@ -502,6 +589,7 @@ export default function SessionPage() {
       )}
 
       <div className="rd-content">
+        {activePanel === 'home' && <HomePanel connectionStatus={connectionStatus} sessionUptime={uptime} />}
         {activePanel === 'screen' && <ScreenViewer ws={ws} isConnected={isConnected} />}
         {activePanel === 'terminal' && (
           <div className="rd-terminal-area">
