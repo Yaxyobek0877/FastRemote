@@ -2260,6 +2260,117 @@ select.rd-settings-input {
   height: 14px;
 }
 
+/* ============================================================
+   HOME PANEL — professional (resurslar + qurilma ma'lumotlari)
+   ============================================================ */
+.hp-page { max-width: 1100px; }
+
+/* Hero — qurilma sarlavhasi */
+.hp-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 18px 20px;
+  margin-bottom: 18px;
+  border-radius: var(--radius-lg);
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.12), rgba(59, 130, 246, 0.08));
+  border: 1px solid var(--border-color);
+}
+.hp-hero-left { display: flex; align-items: center; gap: 14px; }
+.hp-hero-icon {
+  width: 48px; height: 48px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--gradient-accent);
+  color: #fff;
+}
+.hp-hero-icon svg { width: 24px; height: 24px; }
+.hp-hero-name { font-size: 20px; font-weight: 700; color: var(--text-primary); }
+.hp-hero-sub { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); margin-top: 2px; }
+
+.hp-card { margin-bottom: 18px; }
+
+/* Resurs gauge'lari */
+.hp-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+  margin-top: 4px;
+}
+.hp-usage { display: flex; flex-direction: column; gap: 8px; }
+.hp-usage-head { display: flex; align-items: center; gap: 8px; }
+.hp-usage-icon { display: inline-flex; color: var(--text-accent); }
+.hp-usage-icon svg { width: 16px; height: 16px; }
+.hp-usage-label { font-size: 13px; color: var(--text-secondary); flex: 1; }
+.hp-usage-pct { font-size: 15px; font-weight: 700; font-family: var(--font-mono); }
+.hp-usage-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-input);
+  overflow: hidden;
+}
+.hp-usage-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.6s ease;
+}
+.hp-usage-detail { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+
+/* Daraja ranglari */
+.lvl-low  { color: var(--accent-green); }
+.lvl-mid  { color: var(--accent-orange); }
+.lvl-high { color: var(--accent-red); }
+.hp-usage-fill.lvl-low  { background: linear-gradient(90deg, #059669, #10b981); }
+.hp-usage-fill.lvl-mid  { background: linear-gradient(90deg, #d97706, #f59e0b); }
+.hp-usage-fill.lvl-high { background: linear-gradient(90deg, #dc2626, #ef4444); }
+
+/* Qurilma ma'lumotlari */
+.hp-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 4px;
+}
+.hp-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-glass);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  transition: border-color var(--transition-fast);
+}
+.hp-meta:hover { border-color: var(--border-active); }
+.hp-meta-icon {
+  width: 36px; height: 36px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-sm);
+  background: rgba(139, 92, 246, 0.12);
+  color: var(--text-accent);
+}
+.hp-meta-icon svg { width: 18px; height: 18px; }
+.hp-meta-body { min-width: 0; }
+.hp-meta-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.hp-meta-value {
+  font-size: 14px; font-weight: 600; color: var(--text-primary);
+  font-family: var(--font-mono);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+@media (max-width: 900px) {
+  .hp-usage-grid { grid-template-columns: 1fr; }
+  .hp-meta-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 560px) {
+  .hp-meta-grid { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 560px) {
   .home-stats-grid {
     grid-template-columns: 1fr;

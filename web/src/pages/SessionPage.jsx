@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { createSessionSocket, getUsername, logout, getSettings, updateSettings, changePassword as apiChangePassword, addUser as apiAddUser, deleteUser as apiDeleteUser, resetUserPassword as apiResetPassword, getServerInfo, getDeviceInfo } from '../utils/api';
+import { createSessionSocket, getUsername, logout, getSettings, updateSettings, changePassword as apiChangePassword, addUser as apiAddUser, deleteUser as apiDeleteUser, resetUserPassword as apiResetPassword, getServerInfo, getDeviceInfo, formatBytes } from '../utils/api';
 import ScreenViewer from '../components/ScreenViewer';
 import TerminalPanel from '../components/TerminalPanel';
 import FileTransferPanel from '../components/FileTransferPanel';
@@ -297,6 +297,30 @@ function SettingsPage() {
 }
 
 // ====================== HOME PANEL (Bosh sahifa) ======================
+// Resurs ishlatilishi darajasiga qarab rang: yashil < 60% < to'q sariq < 85% < qizil
+function usageLevel(p) {
+  if (p >= 85) return 'high';
+  if (p >= 60) return 'mid';
+  return 'low';
+}
+
+function UsageGauge({ icon, label, percent, detail }) {
+  const p = Math.max(0, Math.min(100, percent || 0));
+  return (
+    <div className="hp-usage">
+      <div className="hp-usage-head">
+        <span className="hp-usage-icon">{icon}</span>
+        <span className="hp-usage-label">{label}</span>
+        <span className={`hp-usage-pct lvl-${usageLevel(p)}`}>{p.toFixed(1)}%</span>
+      </div>
+      <div className="hp-usage-track">
+        <div className={`hp-usage-fill lvl-${usageLevel(p)}`} style={{ width: `${p}%` }} />
+      </div>
+      {detail && <div className="hp-usage-detail">{detail}</div>}
+    </div>
+  );
+}
+
 function HomePanel({ connectionStatus, sessionUptime }) {
   const [info, setInfo] = useState(null);
   const [err, setErr] = useState(false);
@@ -312,49 +336,68 @@ function HomePanel({ connectionStatus, sessionUptime }) {
       }
     };
     load();
-    const t = setInterval(load, 5000); // jonli holat: har 5s
+    const t = setInterval(load, 3000); // jonli holat: har 3s
     return () => { active = false; clearInterval(t); };
   }, []);
 
   const online = connectionStatus === 'connected' && !err;
-  const stats = [
-    { label: 'Operatsion tizim', icon: I.screen, value: info ? `${info.os} (${info.arch})` : '—' },
+  const meta = [
+    { label: 'Operatsion tizim', icon: I.server, value: info ? `${info.os} (${info.arch})` : '—' },
     { label: 'Protsessor yadrolari', icon: I.cpu, value: info ? `${info.cpuCores} ta` : '—' },
     { label: "Ekran o'lchami", icon: I.screen, value: info?.screenWidth ? `${info.screenWidth} × ${info.screenHeight}` : '—' },
     { label: 'IP manzil', icon: I.globe, value: info?.ip || '—' },
-    { label: 'Qurilma ishlash vaqti', icon: I.clock, value: formatSeconds(info?.uptimeSeconds) },
+    { label: 'Ishlash vaqti', icon: I.clock, value: formatSeconds(info?.uptimeSeconds) },
     { label: 'Faol ulanishlar', icon: I.users, value: info ? `${info.viewers ?? 0} ta` : '—' },
   ];
 
   return (
-    <div className="rd-settings-page">
+    <div className="rd-settings-page hp-page">
       <div className="rd-settings-header">
         <h1>{I.home} Bosh sahifa</h1>
       </div>
 
-      {/* Qurilma holati */}
-      <div className="rd-settings-card">
-        <div className="rd-settings-card-header">
-          <h3 className="rd-settings-card-title">{I.server} {info?.deviceName || 'Qurilma'}</h3>
-          <div className={`home-status-pill ${online ? 'is-online' : 'is-offline'}`}>
-            <span className="rd-status-dot" />
-            {online ? 'Onlayn' : 'Oflayn'}
+      {/* Qurilma sarlavhasi + holat */}
+      <div className="hp-hero">
+        <div className="hp-hero-left">
+          <div className="hp-hero-icon">{I.server}</div>
+          <div>
+            <div className="hp-hero-name">{info?.deviceName || 'Qurilma'}</div>
+            <div className="hp-hero-sub">{info?.hostname || '—'} · sessiya {sessionUptime}</div>
           </div>
         </div>
-        {info?.hostname && (
-          <div className="rd-settings-field">
-            <span className="home-host-line">{I.server} {info.hostname} · sessiya: {sessionUptime}</span>
-          </div>
-        )}
-        {err && <div className="rd-settings-msg error">Qurilma holatini olishda xatolik.</div>}
+        <div className={`home-status-pill ${online ? 'is-online' : 'is-offline'}`}>
+          <span className="rd-status-dot" />
+          {online ? 'Onlayn' : 'Oflayn'}
+        </div>
+      </div>
 
-        <div className="home-stats-grid">
-          {stats.map((s, i) => (
-            <div className="home-stat" key={i}>
-              <div className="home-stat-icon">{s.icon}</div>
-              <div className="home-stat-body">
-                <div className="home-stat-label">{s.label}</div>
-                <div className="home-stat-value">{s.value}</div>
+      {err && <div className="rd-settings-msg error">Qurilma holatini olishda xatolik.</div>}
+
+      {/* Resurs ishlatilishi */}
+      {info?.statsSupported && (
+        <div className="rd-settings-card hp-card">
+          <h3 className="rd-settings-card-title">{I.sliders} Tizim resurslari</h3>
+          <div className="hp-usage-grid">
+            <UsageGauge icon={I.cpu} label="Protsessor (CPU)" percent={info.cpuPercent}
+              detail={`${info.cpuCores} yadro`} />
+            <UsageGauge icon={I.server} label="Operativ xotira (RAM)" percent={info.memUsedPercent}
+              detail={`${formatBytes(info.memUsed)} / ${formatBytes(info.memTotal)}`} />
+            <UsageGauge icon={I.folder} label="Disk (/)" percent={info.diskUsedPercent}
+              detail={`${formatBytes(info.diskUsed)} / ${formatBytes(info.diskTotal)}`} />
+          </div>
+        </div>
+      )}
+
+      {/* Qurilma ma'lumotlari */}
+      <div className="rd-settings-card hp-card">
+        <h3 className="rd-settings-card-title">{I.screen} Qurilma ma'lumotlari</h3>
+        <div className="hp-meta-grid">
+          {meta.map((s, i) => (
+            <div className="hp-meta" key={i}>
+              <div className="hp-meta-icon">{s.icon}</div>
+              <div className="hp-meta-body">
+                <div className="hp-meta-label">{s.label}</div>
+                <div className="hp-meta-value">{s.value}</div>
               </div>
             </div>
           ))}

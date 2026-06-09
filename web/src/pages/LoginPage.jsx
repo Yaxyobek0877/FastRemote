@@ -23,7 +23,8 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await login(username, password);
-      navigate('/devices');
+      localStorage.setItem('rd_panel', 'home'); // login'dan keyin doim Bosh sahifa ochilsin
+      navigate('/');
     } catch (err) {
       setError(err.message);
     } finally {

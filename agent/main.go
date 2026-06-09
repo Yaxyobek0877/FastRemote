@@ -174,6 +174,8 @@ func main() {
 	log.Printf("Screen: %dx%d", capturer.ActualWidth, capturer.ActualHeight)
 	log.Printf("Starting standalone server on port %s", port)
 
+	// Start system resource sampler (CPU/RAM/Disk usage)
+	go startStatsSampler()
 	// Start frame distribution goroutine
 	go frameDistributor()
 	// Start cursor distribution goroutine
@@ -327,22 +329,31 @@ func handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	viewersMu.RLock()
 	viewerCount := len(directViewers)
 	viewersMu.RUnlock()
+	stats := getStats()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"deviceName":    deviceName,
-		"hostname":      func() string { h, _ := os.Hostname(); return h }(),
-		"os":            runtime.GOOS,
-		"arch":          runtime.GOARCH,
-		"cpuCores":      runtime.NumCPU(),
-		"goroutines":    runtime.NumGoroutine(),
-		"ip":            getLocalIP(),
-		"screenWidth":   capturer.ActualWidth,
-		"screenHeight":  capturer.ActualHeight,
-		"online":        true,
-		"viewers":       viewerCount,
-		"uptimeSeconds": int64(uptime.Seconds()),
-		"version":       appVersion,
-		"serverTime":    time.Now().Format(time.RFC3339),
+		"deviceName":      deviceName,
+		"hostname":        func() string { h, _ := os.Hostname(); return h }(),
+		"os":              runtime.GOOS,
+		"arch":            runtime.GOARCH,
+		"cpuCores":        runtime.NumCPU(),
+		"goroutines":      runtime.NumGoroutine(),
+		"ip":              getLocalIP(),
+		"screenWidth":     capturer.ActualWidth,
+		"screenHeight":    capturer.ActualHeight,
+		"online":          true,
+		"viewers":         viewerCount,
+		"uptimeSeconds":   int64(uptime.Seconds()),
+		"version":         appVersion,
+		"serverTime":      time.Now().Format(time.RFC3339),
+		"cpuPercent":      stats.CPUPercent,
+		"memUsed":         stats.MemUsed,
+		"memTotal":        stats.MemTotal,
+		"memUsedPercent":  stats.MemUsedPercent,
+		"diskUsed":        stats.DiskUsed,
+		"diskTotal":       stats.DiskTotal,
+		"diskUsedPercent": stats.DiskUsedPercent,
+		"statsSupported":  stats.Supported,
 	})
 }
 
