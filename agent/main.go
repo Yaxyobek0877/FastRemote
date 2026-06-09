@@ -161,6 +161,9 @@ func main() {
 	}
 	deviceID = generateDeviceID(hostname)
 
+	// X displayni tekshirib, kerak bo'lsa mavjud displayga moslash (capture/ffmpeg uchun)
+	ensureDisplay()
+
 	// Initialize components — native resolution, high quality
 	capturer = capture.New(15, 85, 0, 0) // 0,0 = auto-detect (up to 4K)
 	cursorTracker = capture.NewCursorTracker(capturer.ActualWidth, capturer.ActualHeight)
@@ -1078,4 +1081,44 @@ func getEnv(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+// ensureDisplay — DISPLAY o'rnatilmagan yoki mavjud bo'lmagan displayga ishora qilsa,
+// /tmp/.X11-unix dagi birinchi mavjud X socketga moslaydi. Bu ekran capture (kbinani)
+// va ffmpeg x11grab to'g'ri displayni olishini ta'minlaydi.
+func ensureDisplay() {
+	cur := os.Getenv("DISPLAY")
+	if cur != "" && x11SocketExists(cur) {
+		return // joriy DISPLAY ishlaydi
+	}
+	entries, err := os.ReadDir("/tmp/.X11-unix")
+	if err != nil {
+		return // X yo'q (Windows yoki headless) — tegmaymiz
+	}
+	for _, e := range entries {
+		name := e.Name() // masalan "X0"
+		if !strings.HasPrefix(name, "X") {
+			continue
+		}
+		disp := ":" + strings.TrimPrefix(name, "X")
+		os.Setenv("DISPLAY", disp)
+		log.Printf("[Display] DISPLAY %q ishlamadi — %s ga moslandi", cur, disp)
+		return
+	}
+}
+
+// x11SocketExists — DISPLAY (":0", "host:0.0") uchun X socket mavjudligini tekshiradi
+func x11SocketExists(display string) bool {
+	d := display
+	if i := strings.Index(d, ":"); i >= 0 {
+		d = d[i+1:]
+	}
+	if i := strings.Index(d, "."); i >= 0 {
+		d = d[:i]
+	}
+	if d == "" {
+		return false
+	}
+	_, err := os.Stat("/tmp/.X11-unix/X" + d)
+	return err == nil
 }
