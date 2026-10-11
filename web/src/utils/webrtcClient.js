@@ -19,7 +19,6 @@ export function createWebRTCSession({ videoEl, width = 1280, height = 720, fps =
     bundlePolicy: 'max-bundle',
   });
 
-  let receiver = null;
   let catchUpTimer = null;
   let statsTimer = null;
   let keyframeTimer = null;
@@ -31,12 +30,11 @@ export function createWebRTCSession({ videoEl, width = 1280, height = 720, fps =
     try {
       pc.getReceivers().forEach((r) => {
         if (r.track && r.track.kind === 'video') {
-          receiver = r;
           if ('playoutDelayHint' in r) r.playoutDelayHint = 0;
           if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
         }
       });
-    } catch {}
+    } catch { /* Browser may not support this optional operation. */ }
   };
 
   pc.ontrack = (ev) => {
@@ -45,7 +43,7 @@ export function createWebRTCSession({ videoEl, width = 1280, height = 720, fps =
       videoEl.playsInline = true;
       videoEl.muted = true;
       videoEl.autoplay = true;
-      try { videoEl.play(); } catch {}
+      try { videoEl.play(); } catch { /* Browser may not support this optional operation. */ }
     }
     applyLowLatency();
     startCatchUpLoop();
@@ -85,7 +83,7 @@ export function createWebRTCSession({ videoEl, width = 1280, height = 720, fps =
           sdpMid: msg.sdpMid,
           sdpMLineIndex: msg.sdpMLineIndex,
         });
-      } catch (e) { /* ignore */ }
+      } catch { /* Remote ICE candidate may be obsolete. */ }
     } else if (msg.type === 'error') {
       console.error('[WebRTC] server error:', msg.error);
     }
@@ -111,11 +109,11 @@ export function createWebRTCSession({ videoEl, width = 1280, height = 720, fps =
 
       if (delay > EMERGENCY_THRESHOLD) {
         // >3s stuck: jump to latest (keyframe arrives every 1s from server)
-        try { videoEl.currentTime = Math.max(0, latestEnd - 0.05); } catch {}
+        try { videoEl.currentTime = Math.max(0, latestEnd - 0.05); } catch { /* Browser may not support this optional operation. */ }
         videoEl.playbackRate = 1.0;
       } else if (delay > HARD_THRESHOLD) {
         // >500ms: jump to latest
-        try { videoEl.currentTime = Math.max(0, latestEnd - 0.05); } catch {}
+        try { videoEl.currentTime = Math.max(0, latestEnd - 0.05); } catch { /* Browser may not support this optional operation. */ }
         videoEl.playbackRate = 1.0;
       } else if (delay > SOFT_THRESHOLD) {
         // >150ms: speed up slightly (smooth catch-up, AnyDesk-style)
@@ -173,7 +171,7 @@ export function createWebRTCSession({ videoEl, width = 1280, height = 720, fps =
           });
           onStats._lastBytes = bytesReceived;
         }
-      } catch {}
+      } catch { /* Browser may not support this optional operation. */ }
     }, 1500);
   }
   function stopStatsLoop() {
@@ -185,8 +183,8 @@ export function createWebRTCSession({ videoEl, width = 1280, height = 720, fps =
       stopCatchUpLoop();
       stopStatsLoop();
       if (keyframeTimer) clearInterval(keyframeTimer);
-      try { ws.close(); } catch {}
-      try { pc.close(); } catch {}
+      try { ws.close(); } catch { /* Browser may not support this optional operation. */ }
+      try { pc.close(); } catch { /* Browser may not support this optional operation. */ }
       if (videoEl) videoEl.srcObject = null;
     },
   };

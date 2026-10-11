@@ -61,11 +61,10 @@ export default function ScreenViewer({ ws, isConnected }) {
   const [isFocused, setIsFocused] = useState(false);
   const [frameSize, setFrameSize] = useState(0);
   const [latency, setLatency] = useState(0);
-  const [cursorType, setCursorType] = useState('default');
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [audioAvailable, setAudioAvailable] = useState(true);
   const frameCountRef = useRef(0);
-  const lastFpsTimeRef = useRef(Date.now());
+  const lastFpsTimeRef = useRef(0);
   const frameSizeAccum = useRef(0);
   const lastMouseSend = useRef(0);
   const isDecodingRef = useRef(false);
@@ -83,6 +82,28 @@ export default function ScreenViewer({ ws, isConnected }) {
   // ==========================================
   // FRAME HANDLER
   // ==========================================
+  const handleAudioChunk = useCallback((pcmData) => {
+    if (!audioEnabledRef.current || !audioCtxRef.current) return;
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const int16Array = new Int16Array(pcmData);
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768.0;
+    }
+
+    const audioBuffer = ctx.createBuffer(1, float32Array.length, 22050);
+    audioBuffer.getChannelData(0).set(float32Array);
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    const startTime = Math.max(ctx.currentTime, audioNextTime.current);
+    source.start(startTime);
+    audioNextTime.current = startTime + audioBuffer.duration;
+  }, []);
+
   const handleFrame = useCallback((data) => {
     const view = new Uint8Array(data);
 
@@ -107,7 +128,7 @@ export default function ScreenViewer({ ws, isConnected }) {
           timestamp: performance.now() * 1000,
           data: data.slice(2), // 'H' + keyframe bayrog'ini olib tashlaymiz
         }));
-      } catch (e) {
+      } catch {
         gotKeyRef.current = false; // keyingi keyframe'dan qayta boshlaymiz
       }
       return;
@@ -159,33 +180,11 @@ export default function ScreenViewer({ ws, isConnected }) {
       if (decodeTimeoutRef.current) clearTimeout(decodeTimeoutRef.current);
       isDecodingRef.current = false;
     });
-  }, []);
+  }, [handleAudioChunk]);
 
   // ==========================================
   // AUDIO
   // ==========================================
-  const handleAudioChunk = useCallback((pcmData) => {
-    if (!audioEnabledRef.current || !audioCtxRef.current) return;
-    const ctx = audioCtxRef.current;
-    if (ctx.state === 'suspended') ctx.resume();
-
-    const int16Array = new Int16Array(pcmData);
-    const float32Array = new Float32Array(int16Array.length);
-    for (let i = 0; i < int16Array.length; i++) {
-      float32Array[i] = int16Array[i] / 32768.0;
-    }
-
-    const audioBuffer = ctx.createBuffer(1, float32Array.length, 22050);
-    audioBuffer.getChannelData(0).set(float32Array);
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(ctx.destination);
-
-    const startTime = Math.max(ctx.currentTime, audioNextTime.current);
-    source.start(startTime);
-    audioNextTime.current = startTime + audioBuffer.duration;
-  }, []);
-
   const toggleAudio = useCallback(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (audioEnabled) {
@@ -200,7 +199,7 @@ export default function ScreenViewer({ ws, isConnected }) {
         audioEnabledRef.current = true;
         setAudioEnabled(true);
         ws.send(JSON.stringify({ type: 'audio_start' }));
-      } catch (e) { setAudioAvailable(false); }
+      } catch { setAudioAvailable(false); }
     }
   }, [ws, audioEnabled]);
 
@@ -218,8 +217,8 @@ export default function ScreenViewer({ ws, isConnected }) {
   // ==========================================
   const handleCursorFromServer = useCallback((payload) => {
     // Update cursor type from server always
-    if (payload.cursorType) {
-      setCursorType(payload.cursorType);
+    if (cursorRef.current && payload.cursorType) {
+      cursorRef.current.dataset.cursorType = payload.cursorType;
     }
     // NO position override from server — local cursor is always authoritative
     // This prevents the cursor from snapping back to stale server positions
@@ -241,7 +240,7 @@ export default function ScreenViewer({ ws, isConnected }) {
           if (msg.type === 'cursor_position' && msg.payload) {
             handleCursorFromServer(msg.payload);
           }
-        } catch (e) {}
+        } catch { /* Resource may already be closed. */ }
       }
     };
     ws.addEventListener('message', handler);
@@ -387,7 +386,7 @@ export default function ScreenViewer({ ws, isConnected }) {
   // H.264 (WebCodecs) lifecycle — past-kechikish, tunnel orqali ham ishlaydi
   useEffect(() => {
     if (!isConnected || !ws || mode !== 'h264') return;
-    if (!('VideoDecoder' in window)) { setMode('jpeg'); return; }
+    if (!('VideoDecoder' in window)) return; // Initial mode already falls back to JPEG.
 
     let decoder;
     try {
@@ -418,6 +417,8 @@ export default function ScreenViewer({ ws, isConnected }) {
       decoder.configure({ codec: 'avc1.42E01F', optimizeForLatency: true });
     } catch (e) {
       console.error('[H264] init failed, JPEG zaxirasiga o\'tildi:', e);
+      // Decoder initialization can fail despite feature detection.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setMode('jpeg');
       return;
     }
@@ -434,9 +435,9 @@ export default function ScreenViewer({ ws, isConnected }) {
     else ws.addEventListener('open', startVideo, { once: true });
 
     return () => {
-      try { ws.removeEventListener('open', startVideo); } catch {}
-      try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'video_stop' })); } catch {}
-      try { decoder.close(); } catch {}
+      try { ws.removeEventListener('open', startVideo); } catch { /* Resource may already be closed. */ }
+      try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'video_stop' })); } catch { /* Resource may already be closed. */ }
+      try { decoder.close(); } catch { /* Resource may already be closed. */ }
       decoderRef.current = null;
       gotKeyRef.current = false;
     };

@@ -263,10 +263,7 @@ func (s *webrtcSession) ffmpegLoop() {
 }
 
 func (s *webrtcSession) runFFmpeg(width, height, fps, bitrateKbps int) {
-	display := os.Getenv("DISPLAY")
-	if display == "" {
-		display = ":1"
-	}
+	display := currentDisplay()
 
 	encoder := pickEncoder()
 	args := []string{

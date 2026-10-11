@@ -49,3 +49,5 @@ Thumbs.db
 
 # Logs
 *.log
+/agent/fastremote-web
+/agent/fastremote-web.next

@@ -155,3 +155,80 @@ Standart loginingiz:
 * **Password**: `admin123` *(Service faylga yozganingiz)*
 
 Kira solib **Settings** bo'limidan maxfiy parolingizni yangilab oling!
+
+### Persistent terminal deployment (standalone Linux agent)
+
+The terminal workspace uses a dedicated tmux server and authenticated
+`/api/terminals` / `/ws/terminal` endpoints. Each account has its own catalogue,
+active tab, names and independent shells. Closing a browser, switching pages or
+restarting the HTTP agent only detaches clients. Shells, working directories,
+running commands and full-screen application state remain in tmux. The active
+device controls the shared pane size; other devices can reconnect or type to
+fit it to their own viewport.
+
+On this server the source is `/disk1/test_project/FastRemote`. The user services
+are `fastremote-terminal.service` (tmux) and `fastremote-web.service` (HTTP on
+9091). Templates and the isolated tmux configuration are in `deploy/`.
+Copy the units to `~/.config/systemd/user/`, run `systemctl --user daemon-reload`,
+then enable both with `systemctl --user enable --now fastremote-terminal
+fastremote-web`. The deployment paths in these units must match the checkout.
+
+Build the frontend with `cd web && npm ci && npm run build`, copy `web/dist/.`
+into `agent/dist/`, then build the agent with `go build -o fastremote-web.next .`
+from `agent/`. Replace `fastremote-web` by renaming the new binary and restart
+**only `fastremote-web.service`**. Do not restart the tmux service during ordinary
+web deployments, because that would end running shells. The runtime socket is
+`$XDG_RUNTIME_DIR/fastremote/tmux.sock`; `TERMINAL_SOCKET` can override it.
+
+The catalogue and private ANSI checkpoints are under `agent/data/terminals/`
+(`TERMINAL_DATA_DIR` overrides this path). Files are written atomically with
+owner-only permissions. Up to 24 terminals per account and 10,000 scrollback
+lines per terminal are retained. Current screen/history checkpoints are saved
+every 15 seconds. A full host restart or tmux failure ends running processes;
+the catalogue and latest saved output remain available as stopped sessions.
+Processes are not silently restarted, since replaying commands can repeat side
+effects. Terminals execute as the agent's OS user, as the remote desktop does;
+account-scoped API ownership is not an OS sandbox.
+
+For the initial migration, the old `fastremote-agent.service` remains on 9090
+so an existing shell is not terminated. An optional local systemd drop-in sets
+`LEGACY_TERMINAL_URL` and `LEGACY_TERMINAL_OWNER` to expose that shell only to
+its owner as **Avvalgi terminal**. Its earlier browser-only scrollback cannot
+be recovered. On reconnect the browser briefly changes and restores the old
+PTY's width to request a fresh application screen without sending keystrokes.
+It reports a connected terminal only after shell output arrives.
+New sessions always use the persistent system. Remove this
+bridge and retire the old service only after the owner has finished the old
+shell. Cloudflare ingress points to the new HTTP port after validation.
+
+Validation: `cd agent && go test -race ./... && go vet ./...`; frontend build and
+ESLint on the changed components. `web/scripts/verify-terminals.cjs` is a local
+integration check requiring Playwright (`PLAYWRIGHT_MODULE` can locate it),
+Chrome, and read access to `agent/.jwt_secret`. It creates isolated test owners,
+checks browser disconnect/reconnect, independent sessions, Unicode, history,
+full-screen state and mobile layouts, then deletes its own terminals. Setting
+`TEST_SERVICE_RESTART=1` also restarts the staging `fastremote-web.service` and
+checks that the shell PID is unchanged. Do not use that flag against unrelated
+services. The script defaults to `http://127.0.0.1:9091`.
+`web/scripts/verify-legacy-terminal.cjs` checks legacy readiness and same-size
+reloads using mocked WebSockets, without connecting to an existing user shell.
+
+### Project terminals
+
+The terminal view has two fixed control rows: session tabs and new terminal,
+then connection status and actions. Font size, rename, delete and history export
+are under `•••`; `⌨` toggles touch keys over the terminal. Choosing a project in
+**Yangi terminal** starts the shell directly in that folder. The chosen folder
+is remembered in this browser and persisted with the session. Existing sessions
+continue running without changing their current directory.
+
+Copy `deploy/projects.example.json` to `~/.config/fastremote/projects.json` and
+edit the names and absolute paths (or `~/...`). `TERMINAL_PROJECTS_FILE` overrides
+the configuration path. Only existing directories are shown. Users can also
+enter another full directory path; access uses the server OS account's existing
+filesystem permissions, just like commands in its shell.
+
+`web/scripts/verify-projects.cjs` verifies preset selection, the real shell working
+directory, remembered project selection, invalid paths, menus, and the two-row
+layout at 320–1440 px. Set `FASTREMOTE_PROJECT_PATH` to a configured preset path
+(default: this repository). It creates and removes only its own test sessions.

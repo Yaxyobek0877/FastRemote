@@ -1,10 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { createSessionSocket, getUsername, logout, getSettings, updateSettings, changePassword as apiChangePassword, addUser as apiAddUser, deleteUser as apiDeleteUser, resetUserPassword as apiResetPassword, getServerInfo, getDeviceInfo, formatBytes } from '../utils/api';
 
 const PANELS = ['home', 'screen', 'terminal', 'files', 'settings'];
-import ScreenViewer from '../components/ScreenViewer';
-import TerminalPanel from '../components/TerminalPanel';
+const ScreenViewer = lazy(() => import('../components/ScreenViewer'));
+const TerminalWorkspace = lazy(() => import('../components/TerminalWorkspace'));
 import FileTransferPanel from '../components/FileTransferPanel';
 
 const QUALITY_PRESETS = {
@@ -86,11 +86,11 @@ function SettingsPage() {
       const d = await getSettings();
       if (d.deviceName) setDName(d.deviceName);
       if (d.users) setUsers(d.users);
-    } catch {}
+    } catch { /* Settings can be retried. */ }
   };
 
   useEffect(() => {
-    loadSettings();
+    getSettings().then(d => { if (d.deviceName) setDName(d.deviceName); if (d.users) setUsers(d.users); }).catch(() => {});
     getServerInfo().then(setServerInfo).catch(() => {});
   }, []);
 
@@ -108,7 +108,7 @@ function SettingsPage() {
     { ok: p.length >= 8, text: 'At least 8 characters' },
     { ok: /[a-zA-Z]/.test(p), text: 'Contains a letter' },
     { ok: /\d/.test(p), text: 'Contains a number' },
-    { ok: /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?~`]/.test(p), text: 'Contains a symbol' },
+    { ok: /[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?~`]/.test(p), text: 'Contains a symbol' },
   ];
 
   const handleChangePass = async (e) => {
@@ -326,7 +326,7 @@ function UsageGauge({ icon, label, percent, detail }) {
   );
 }
 
-function HomePanel({ connectionStatus, sessionUptime }) {
+function HomePanel({ sessionUptime }) {
   const [info, setInfo] = useState(null);
   const [err, setErr] = useState(false);
 
@@ -345,7 +345,7 @@ function HomePanel({ connectionStatus, sessionUptime }) {
     return () => { active = false; clearInterval(t); };
   }, []);
 
-  const online = connectionStatus === 'connected' && !err;
+  const online = !!info?.online && !err;
   const disks = info?.disks || [];
   const gpus = info?.gpus || [];
   const meta = [
@@ -445,17 +445,29 @@ export default function SessionPage() {
   const [isConnected, setIsConnected] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [deviceInfo, setDeviceInfo] = useState({ name: 'FastRemote', os: '' });
-  const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem('rd_sidebar') !== 'closed');
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 768 && localStorage.getItem('rd_sidebar') !== 'closed');
   const [qualityPreset, setQualityPreset] = useState('high');
   const [customQuality, setCustomQuality] = useState({ fps: 15, quality: 80, maxWidth: 3840, maxHeight: 2160 });
   const [showQualityMenu, setShowQualityMenu] = useState(false);
-  const [terminalTabs, setTerminalTabs] = useState([{ id: 1, label: 'Shell 1' }]);
-  const [activeTerminalTab, setActiveTerminalTab] = useState(1);
-  const [nextTabId, setNextTabId] = useState(2);
   const [sessionStart] = useState(Date.now());
   const [uptime, setUptime] = useState('0s');
   const wsRef = useRef(null);
   const username = getUsername();
+  const needsDesktop = activePanel === 'screen' || activePanel === 'files';
+
+  useEffect(() => {
+    const update = () => document.documentElement.style.setProperty('--app-height', `${window.visualViewport?.height || window.innerHeight}px`);
+    update(); window.visualViewport?.addEventListener('resize', update); window.addEventListener('resize', update);
+    return () => { window.visualViewport?.removeEventListener('resize', update); window.removeEventListener('resize', update); document.documentElement.style.removeProperty('--app-height'); };
+  }, []);
+
+  useEffect(() => {
+    if (needsDesktop) return;
+    let cancelled = false;
+    const check = () => getDeviceInfo().then(info => { if (!cancelled) { setConnectionStatus(info.online ? 'connected' : 'offline'); setDeviceInfo({ name: info.deviceName, os: info.os }); } }).catch(() => { if (!cancelled) setConnectionStatus('offline'); });
+    check(); const timer = setInterval(check, 15000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [needsDesktop]);
 
   // Session timer
   useEffect(() => {
@@ -463,11 +475,21 @@ export default function SessionPage() {
     return () => clearInterval(t);
   }, [sessionStart]);
 
+  // Crossing into a phone layout must not turn the desktop sidebar into a
+  // blocking modal over the terminal (including browser rotation/resizing).
+  useEffect(() => {
+    const mobile = window.matchMedia('(max-width: 768px)');
+    const changed = event => { if (event.matches) setSidebarOpen(false); };
+    mobile.addEventListener('change', changed);
+    return () => mobile.removeEventListener('change', changed);
+  }, []);
+
   // Persist sidebar holati (faol panel endi URL'da saqlanadi)
   useEffect(() => { localStorage.setItem('rd_sidebar', sidebarOpen ? 'open' : 'closed'); }, [sidebarOpen]);
 
-  // WebSocket with exponential backoff reconnect
+  // Desktop connection is only needed on the screen and file panels.
   useEffect(() => {
+    if (!needsDesktop) return;
     let cancelled = false;
     let reconnectTimer = null;
     let retryCount = 0;
@@ -492,20 +514,17 @@ export default function SessionPage() {
             if (msg.type === 'system_info') {
               setDeviceInfo({ name: msg.payload.deviceName || msg.payload.hostname, os: msg.payload.os });
             }
-          } catch (e) {}
+          } catch { /* Ignore non-JSON frames. */ }
         }
       };
       socket.onclose = (e) => {
         setIsConnected(false);
         if (e.code === 4001) { logout(); return; }
         const lifespan = Date.now() - openTime;
-        if (!everConnected && lifespan < 2000) {
-          retryCount++;
-          if (retryCount >= 3) { logout(); return; }
-        }
+        if (!everConnected && lifespan < 2000) retryCount++;
         const delay = Math.min(2000 * Math.pow(1.5, retryCount), 30000);
         retryCount++;
-        if (retryCount > 15) { setConnectionStatus('failed'); return; }
+
         setConnectionStatus('reconnecting');
         if (!cancelled) { reconnectTimer = setTimeout(connect, delay); }
       };
@@ -518,9 +537,9 @@ export default function SessionPage() {
     return () => {
       cancelled = true;
       clearTimeout(reconnectTimer);
-      if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+      if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null; }
     };
-  }, []);
+  }, [needsDesktop]);
 
   const changeQuality = useCallback((preset) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -538,37 +557,21 @@ export default function SessionPage() {
     setShowQualityMenu(false);
   }, [ws, customQuality]);
 
-  const addTerminalTab = useCallback(() => {
-    const newId = nextTabId;
-    setTerminalTabs(prev => [...prev, { id: newId, label: `Shell ${newId}` }]);
-    setActiveTerminalTab(newId);
-    setNextTabId(prev => prev + 1);
-    setActivePanel('terminal');
-  }, [nextTabId]);
-
-  const closeTerminalTab = useCallback((tabId) => {
-    setTerminalTabs(prev => {
-      const newTabs = prev.filter(t => t.id !== tabId);
-      if (newTabs.length === 0) {
-        const nid = nextTabId;
-        setNextTabId(p => p + 1);
-        setActiveTerminalTab(nid);
-        return [{ id: nid, label: `Shell ${nid}` }];
-      }
-      if (activeTerminalTab === tabId) setActiveTerminalTab(newTabs[newTabs.length - 1].id);
-      return newTabs;
-    });
-  }, [activeTerminalTab, nextTabId]);
-
   const toggleFullscreen = () => {
     if (document.fullscreenElement) document.exitFullscreen();
-    else document.documentElement.requestFullscreen();
+    else document.documentElement.requestFullscreen?.().catch(() => {});
   };
 
   const statusDot = connectionStatus === 'connected' ? '#10b981' : connectionStatus === 'reconnecting' ? '#f59e0b' : '#ef4444';
 
   return (
     <div className="rd-layout">
+      <header className="rd-mobile-header">
+        <button aria-label="Menyuni ochish" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(!sidebarOpen)}>☰</button>
+        <strong>{activePanel === 'home' ? 'Bosh sahifa' : activePanel === 'terminal' ? 'Terminal' : activePanel === 'files' ? 'Fayllar' : activePanel === 'settings' ? 'Sozlamalar' : 'Ekran'}</strong>
+        <span className="rd-status-dot" style={{ background: statusDot }} />
+      </header>
+      {sidebarOpen && <button className="rd-sidebar-backdrop" aria-label="Menyuni yopish" onClick={() => setSidebarOpen(false)} />}
       {sidebarOpen && (
         <div className="rd-sidebar">
           <div className="rd-sidebar-brand">
@@ -588,12 +591,12 @@ export default function SessionPage() {
             {[
               { id: 'home', icon: I.home, label: 'Bosh sahifa' },
               { id: 'screen', icon: I.screen, label: 'Screen' },
-              { id: 'terminal', icon: I.terminal, label: 'Terminal', badge: terminalTabs.length > 1 ? terminalTabs.length : null },
+              { id: 'terminal', icon: I.terminal, label: 'Terminal' },
               { id: 'files', icon: I.folder, label: 'Files' },
               { id: 'settings', icon: I.settings, label: 'Settings' },
             ].map(item => (
               <button key={item.id} className={`rd-sidebar-btn ${activePanel === item.id ? 'active' : ''}`}
-                onClick={() => setActivePanel(item.id)} id={`nav-${item.id}`}>
+                onClick={() => { setActivePanel(item.id); if (window.innerWidth <= 768) setSidebarOpen(false); }} id={`nav-${item.id}`}>
                 <span className="rd-btn-icon">{item.icon}</span>
                 <span className="rd-btn-label">{item.label}</span>
                 {item.badge && <span className="rd-btn-badge">{item.badge}</span>}
@@ -618,7 +621,7 @@ export default function SessionPage() {
                     <span className="rd-quality-detail">{preset.fps}fps · q{preset.quality}</span>
                   </button>
                 ))}
-                
+
                 <div style={{ padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px', borderTop: '1px solid rgba(255,255,255,0.1)', marginTop: '5px' }}>
                    <span style={{ fontSize: '0.8rem', color: '#9ca3af', fontWeight: 'bold' }}>MANUAL CONFIG</span>
                    <div style={{ display: 'flex', gap: '10px' }}>
@@ -662,33 +665,13 @@ export default function SessionPage() {
       )}
 
       <div className="rd-content">
+        <Suspense fallback={<div className="terminal-empty" role="status">Yuklanmoqda…</div>}>
         {activePanel === 'home' && <HomePanel connectionStatus={connectionStatus} sessionUptime={uptime} />}
         {activePanel === 'screen' && <ScreenViewer ws={ws} isConnected={isConnected} />}
-        {activePanel === 'terminal' && (
-          <div className="rd-terminal-area">
-            <div className="rd-terminal-tabs">
-              {terminalTabs.map(tab => (
-                <div key={tab.id} className={`rd-term-tab ${activeTerminalTab === tab.id ? 'active' : ''}`}
-                  onClick={() => setActiveTerminalTab(tab.id)}>
-                  <span className="rd-term-tab-icon">{I.terminal}</span>
-                  <span className="rd-term-tab-label">{tab.label}</span>
-                  <button className="rd-term-tab-close"
-                    onClick={(e) => { e.stopPropagation(); closeTerminalTab(tab.id); }}>{I.close}</button>
-                </div>
-              ))}
-              <button className="rd-term-tab-add" onClick={addTerminalTab} title="New terminal">{I.plus}</button>
-            </div>
-            {terminalTabs.map(tab => (
-              <div key={tab.id} className="rd-terminal-panel-wrapper"
-                style={{ display: activeTerminalTab === tab.id ? 'flex' : 'none' }}>
-                <TerminalPanel ws={ws} isConnected={isConnected} sessionId={tab.id}
-                  isVisible={activeTerminalTab === tab.id} />
-              </div>
-            ))}
-          </div>
-        )}
+        {activePanel === 'terminal' && <TerminalWorkspace />}
         {activePanel === 'files' && <FileTransferPanel ws={ws} isConnected={isConnected} />}
         {activePanel === 'settings' && <SettingsPage />}
+        </Suspense>
       </div>
     </div>
   );

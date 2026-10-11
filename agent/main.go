@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"io/fs"
@@ -8,7 +9,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +23,7 @@ import (
 	"fastremote-agent/capture"
 	"fastremote-agent/filetransfer"
 	"fastremote-agent/input"
-	"fastremote-agent/shell"
+	"fastremote-agent/terminal"
 )
 
 //go:embed dist
@@ -50,15 +54,6 @@ type KeyboardEvent struct {
 	Alt    bool   `json:"alt"`
 	Shift  bool   `json:"shift"`
 	Meta   bool   `json:"meta"`
-}
-
-type ShellInput struct {
-	Data string `json:"data"`
-}
-
-type ShellResize struct {
-	Cols int `json:"cols"`
-	Rows int `json:"rows"`
 }
 
 type FileListRequest struct {
@@ -101,14 +96,14 @@ type SystemInfo struct {
 
 // wsMsg is a message for the per-viewer write channels
 type wsMsg struct {
-	msgType int    // websocket.BinaryMessage or websocket.TextMessage
+	msgType int // websocket.BinaryMessage or websocket.TextMessage
 	data    []byte
 }
 
 type Viewer struct {
-	FrameChan chan []byte  // JPEG frames (zaxira yo'l)
-	VideoChan chan []byte  // H264 access unitlar (asosiy past-kechikish yo'l)
-	JsonChan  chan wsMsg   // JSON messages (cursor, shell output, etc.)
+	FrameChan chan []byte // JPEG frames (zaxira yo'l)
+	VideoChan chan []byte // H264 access unitlar (asosiy past-kechikish yo'l)
+	JsonChan  chan wsMsg  // JSON messages (cursor, shell output, etc.)
 	WriteMu   *sync.Mutex // fallback mutex for direct writes (pre-registration)
 	Done      chan struct{}
 
@@ -122,7 +117,6 @@ var (
 	cursorTracker *capture.CursorTracker
 	audioCapturer *capture.AudioCapturer
 	inputH        *input.Handler
-	shellSess     *shell.Shell
 	deviceID      string
 	userStore     *UserStore
 	startTime     = time.Now() // agent boshlangan vaqt (uptime hisoblash uchun)
@@ -192,12 +186,19 @@ func main() {
 	// Start audio distribution goroutine
 	go audioDistributor()
 
+	var terminalErr error
+	terminals, terminalErr = terminal.New(getEnv("TERMINAL_DATA_DIR", "data/terminals"), getEnv("TERMINAL_SOCKET", "/run/user/1000/fastremote/tmux.sock"))
+	if terminalErr != nil {
+		log.Fatalf("Terminal catalogue: %v", terminalErr)
+	}
+	go terminals.Checkpoint(context.Background())
+
 	// Start HTTP Server
 	startServer(port, deviceName, hostname)
 }
 
 // ============================================================
-// HTTP SERVER 
+// HTTP SERVER
 // ============================================================
 
 func startServer(port, dn, hostname string) {
@@ -226,6 +227,8 @@ func startServer(port, dn, hostname string) {
 			"hostname":   hostname,
 		})
 	})
+
+	registerTerminals(mux)
 
 	// WebSocket Endpoint
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -276,7 +279,7 @@ func startServer(port, dn, hostname string) {
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
@@ -341,20 +344,20 @@ func handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	stats := getStats()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"deviceName":      deviceName,
-		"hostname":        func() string { h, _ := os.Hostname(); return h }(),
-		"os":              runtime.GOOS,
-		"arch":            runtime.GOARCH,
-		"cpuCores":        runtime.NumCPU(),
-		"goroutines":      runtime.NumGoroutine(),
-		"ip":              getLocalIP(),
-		"screenWidth":     capturer.ActualWidth,
-		"screenHeight":    capturer.ActualHeight,
-		"online":          true,
-		"viewers":         viewerCount,
-		"uptimeSeconds":   int64(uptime.Seconds()),
-		"version":         appVersion,
-		"serverTime":      time.Now().Format(time.RFC3339),
+		"deviceName":     deviceName,
+		"hostname":       func() string { h, _ := os.Hostname(); return h }(),
+		"os":             runtime.GOOS,
+		"arch":           runtime.GOARCH,
+		"cpuCores":       runtime.NumCPU(),
+		"goroutines":     runtime.NumGoroutine(),
+		"ip":             getLocalIP(),
+		"screenWidth":    capturer.ActualWidth,
+		"screenHeight":   capturer.ActualHeight,
+		"online":         true,
+		"viewers":        viewerCount,
+		"uptimeSeconds":  int64(uptime.Seconds()),
+		"version":        appVersion,
+		"serverTime":     time.Now().Format(time.RFC3339),
 		"cpuPercent":     stats.CPUPercent,
 		"memUsed":        stats.MemUsed,
 		"memTotal":       stats.MemTotal,
@@ -543,9 +546,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request, hostname string) {
 
 	// Register viewer
 	v := &Viewer{
-		FrameChan: make(chan []byte, 3),    // JPEG frames (zaxira)
-		VideoChan: make(chan []byte, 256),  // H264 access unitlar (asosiy)
-		JsonChan:  make(chan wsMsg, 30),    // JSON messages (lower priority)
+		FrameChan: make(chan []byte, 3),   // JPEG frames (zaxira)
+		VideoChan: make(chan []byte, 256), // H264 access unitlar (asosiy)
+		JsonChan:  make(chan wsMsg, 30),   // JSON messages (lower priority)
 		WriteMu:   &sync.Mutex{},
 		Done:      make(chan struct{}),
 	}
@@ -713,18 +716,6 @@ func handleViewerMessage(msg WSMessage, viewerConn *websocket.Conn, fileHandler 
 		var event KeyboardEvent
 		if err := json.Unmarshal(msg.Payload, &event); err == nil {
 			handleKeyboardEvent(event)
-		}
-
-	case "shell_input":
-		var input ShellInput
-		if err := json.Unmarshal(msg.Payload, &input); err == nil {
-			handleShellInput(input.Data, viewerConn)
-		}
-
-	case "shell_resize":
-		var resize ShellResize
-		if err := json.Unmarshal(msg.Payload, &resize); err == nil {
-			handleShellResize(resize, viewerConn)
 		}
 
 	case "quality_settings":
@@ -1044,38 +1035,6 @@ func handleKeyboardEvent(event KeyboardEvent) {
 	}
 }
 
-func ensureShellStarted(viewerConn *websocket.Conn) {
-	if shellSess == nil || !shellSess.IsActive() {
-		var err error
-		shellSess, err = shell.New()
-		if err != nil {
-			log.Printf("Failed to start shell: %v", err)
-			errorMsg := "Error: " + err.Error() + "\r\n"
-			if viewerConn != nil {
-				sendJSONToConn(viewerConn, "shell_output", map[string]string{"data": errorMsg})
-			}
-			return
-		}
-		go shellOutputForwarder()
-	}
-}
-
-func handleShellInput(data string, viewerConn *websocket.Conn) {
-	ensureShellStarted(viewerConn)
-	if shellSess != nil && shellSess.IsActive() {
-		shellSess.Write(data)
-	}
-}
-
-func handleShellResize(resize ShellResize, viewerConn *websocket.Conn) {
-	ensureShellStarted(viewerConn)
-	if shellSess != nil && shellSess.IsActive() {
-		if resize.Cols > 0 && resize.Rows > 0 {
-			shellSess.Resize(uint16(resize.Cols), uint16(resize.Rows))
-		}
-	}
-}
-
 func handleQualitySettings(settings QualitySettings) {
 	log.Printf("[Quality] Received settings: FPS=%d, Quality=%d, Resolution=%dx%d",
 		settings.FPS, settings.Quality, settings.MaxWidth, settings.MaxHeight)
@@ -1091,19 +1050,6 @@ func handleQualitySettings(settings QualitySettings) {
 		})
 	}
 	viewersMu.RUnlock()
-}
-
-func shellOutputForwarder() {
-	for output := range shellSess.Output() {
-		payload := map[string]string{"data": output}
-
-		// Send shell output to ALL viewers
-		viewersMu.RLock()
-		for viewer := range directViewers {
-			sendJSONToConn(viewer, "shell_output", payload)
-		}
-		viewersMu.RUnlock()
-	}
 }
 
 // ============================================================
@@ -1196,28 +1142,110 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-// ensureDisplay — DISPLAY o'rnatilmagan yoki mavjud bo'lmagan displayga ishora qilsa,
-// /tmp/.X11-unix dagi birinchi mavjud X socketga moslaydi. Bu ekran capture (kbinani)
-// va ffmpeg x11grab to'g'ri displayni olishini ta'minlaydi.
+// ensureDisplay — DISPLAY/XAUTHORITY o'rnatilmagan yoki ishlamaydigan X displayga
+// ishora qilsa, mavjud X socket va auth fayllardan foydalanib ishlaydigan sessiyani
+// topishga urinadi. Bu capture (kbinani) va ffmpeg x11grab bir xil displayni olishini
+// ta'minlaydi.
 func ensureDisplay() {
 	cur := os.Getenv("DISPLAY")
-	if cur != "" && x11SocketExists(cur) {
-		return // joriy DISPLAY ishlaydi
+	auth := os.Getenv("XAUTHORITY")
+	if cur != "" && x11DisplayUsable(cur, auth) {
+		log.Printf("[Display] X display tayyor: DISPLAY=%s XAUTHORITY=%s", cur, printableAuth(auth))
+		return
 	}
+	if cur != "" && auth != "" && x11DisplayUsable(cur, "") {
+		os.Unsetenv("XAUTHORITY")
+		log.Printf("[Display] DISPLAY=%s XAUTHORITYsiz ishladi; noto'g'ri XAUTHORITY olib tashlandi", cur)
+		return
+	}
+
+	authCandidates := xauthorityCandidates()
+	if auth == "" {
+		for _, cand := range authCandidates {
+			os.Setenv("XAUTHORITY", cand)
+			if cur != "" && x11DisplayUsable(cur, cand) {
+				log.Printf("[Display] XAUTHORITY %s tanlandi (DISPLAY=%s)", cand, cur)
+				return
+			}
+		}
+		os.Unsetenv("XAUTHORITY")
+	}
+
 	entries, err := os.ReadDir("/tmp/.X11-unix")
 	if err != nil {
 		return // X yo'q (Windows yoki headless) — tegmaymiz
 	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	for _, e := range entries {
 		name := e.Name() // masalan "X0"
 		if !strings.HasPrefix(name, "X") {
 			continue
 		}
 		disp := ":" + strings.TrimPrefix(name, "X")
-		os.Setenv("DISPLAY", disp)
-		log.Printf("[Display] DISPLAY %q ishlamadi — %s ga moslandi", cur, disp)
+		if x11DisplayUsable(disp, auth) {
+			os.Setenv("DISPLAY", disp)
+			log.Printf("[Display] DISPLAY %q ishlamadi — %s ga moslandi", cur, disp)
+			return
+		}
+		if auth != "" && x11DisplayUsable(disp, "") {
+			os.Setenv("DISPLAY", disp)
+			os.Unsetenv("XAUTHORITY")
+			log.Printf("[Display] DISPLAY=%s XAUTHORITYsiz ishladi; noto'g'ri XAUTHORITY olib tashlandi", disp)
+			return
+		}
+		for _, cand := range authCandidates {
+			os.Setenv("XAUTHORITY", cand)
+			if x11DisplayUsable(disp, cand) {
+				os.Setenv("DISPLAY", disp)
+				log.Printf("[Display] DISPLAY=%s XAUTHORITY=%s tanlandi", disp, cand)
+				return
+			}
+		}
+		if auth == "" {
+			os.Unsetenv("XAUTHORITY")
+		} else {
+			os.Setenv("XAUTHORITY", auth)
+		}
+	}
+
+	if cur == "" {
+		if disp := firstXDisplay(); disp != "" {
+			os.Setenv("DISPLAY", disp)
+			log.Printf("[Display] X display ochilmadi, lekin socket topildi: DISPLAY=%s. XAUTHORITY kerak bo'lishi mumkin", disp)
+		}
 		return
 	}
+	log.Printf("[Display] DISPLAY=%s ochilmadi. XAUTHORITY=%s", cur, printableAuth(os.Getenv("XAUTHORITY")))
+}
+
+func currentDisplay() string {
+	display := os.Getenv("DISPLAY")
+	if display != "" {
+		return display
+	}
+	if disp := firstXDisplay(); disp != "" {
+		return disp
+	}
+	return ":0"
+}
+
+func firstXDisplay() string {
+	entries, err := os.ReadDir("/tmp/.X11-unix")
+	if err != nil {
+		return ""
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "X") {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		return ":" + strings.TrimPrefix(name, "X")
+	}
+	return ""
 }
 
 // x11SocketExists — DISPLAY (":0", "host:0.0") uchun X socket mavjudligini tekshiradi
@@ -1234,4 +1262,92 @@ func x11SocketExists(display string) bool {
 	}
 	_, err := os.Stat("/tmp/.X11-unix/X" + d)
 	return err == nil
+}
+
+func x11DisplayUsable(display, xauthority string) bool {
+	if display == "" || !x11SocketExists(display) {
+		return false
+	}
+	if _, err := exec.LookPath("xdpyinfo"); err != nil {
+		return true
+	}
+	cmd := exec.Command("xdpyinfo", "-display", display)
+	cmd.Env = x11Env(display, xauthority)
+	return cmd.Run() == nil
+}
+
+func x11Env(display, xauthority string) []string {
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "DISPLAY=") || strings.HasPrefix(kv, "XAUTHORITY=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	env = append(env, "DISPLAY="+display)
+	if xauthority != "" {
+		env = append(env, "XAUTHORITY="+xauthority)
+	}
+	return env
+}
+
+func xauthorityCandidates() []string {
+	seen := make(map[string]bool)
+	var candidates []string
+	add := func(path string) {
+		if path == "" || seen[path] {
+			return
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return
+		}
+		_ = f.Close()
+		seen[path] = true
+		candidates = append(candidates, path)
+	}
+
+	add(os.Getenv("XAUTHORITY"))
+	if home, err := os.UserHomeDir(); err == nil {
+		add(filepath.Join(home, ".Xauthority"))
+	}
+
+	for _, pattern := range []string{
+		"/run/user/*/gdm/Xauthority",
+		"/run/user/*/.Xauthority",
+		"/home/*/.Xauthority",
+	} {
+		matches, _ := filepath.Glob(pattern)
+		sort.Strings(matches)
+		for _, match := range matches {
+			add(match)
+		}
+	}
+	for _, cand := range xorgAuthCandidates() {
+		add(cand)
+	}
+
+	return candidates
+}
+
+func xorgAuthCandidates() []string {
+	out, err := exec.Command("pgrep", "-a", "Xorg").Output()
+	if err != nil {
+		return nil
+	}
+	fields := strings.Fields(string(out))
+	var candidates []string
+	for i, field := range fields {
+		if field == "-auth" && i+1 < len(fields) {
+			candidates = append(candidates, fields[i+1])
+		}
+	}
+	return candidates
+}
+
+func printableAuth(path string) string {
+	if path == "" {
+		return "(empty)"
+	}
+	return path
 }

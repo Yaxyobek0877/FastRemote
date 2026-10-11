@@ -65,10 +65,7 @@ func (s *h264Streamer) loop(width, height, fps, bitrateKbps int, sink func([]byt
 }
 
 func (s *h264Streamer) run(width, height, fps, bitrateKbps int, sink func([]byte, bool)) {
-	display := os.Getenv("DISPLAY")
-	if display == "" {
-		display = ":0"
-	}
+	display := currentDisplay()
 	encoder := pickEncoder()
 	args := []string{
 		"-hide_banner", "-loglevel", "error",

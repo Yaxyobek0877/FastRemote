@@ -1,0 +1,19 @@
+[Unit]
+Description=FastRemote web and persistent terminal gateway
+After=network-online.target fastremote-terminal.service
+Wants=network-online.target fastremote-terminal.service
+
+[Service]
+Type=simple
+WorkingDirectory=/disk1/test_project/FastRemote/agent
+Environment=PORT=9091
+Environment=DISPLAY=:1
+Environment=XAUTHORITY=/run/user/1000/gdm/Xauthority
+Environment=PATH=/home/face/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=TERMINAL_SOCKET=%t/fastremote/tmux.sock
+ExecStart=/disk1/test_project/FastRemote/agent/fastremote-web
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

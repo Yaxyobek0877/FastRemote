@@ -1,10 +1,6 @@
-const API_BASE = window.location.hostname === 'localhost' 
-  ? 'http://localhost:9090' // Default standalone agent port
-  : `${window.location.protocol}//${window.location.hostname}${window.location.port ? `:${window.location.port}` : ''}`;
-
-const WS_BASE = window.location.hostname === 'localhost'
-  ? 'ws://localhost:9090'
-  : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}${window.location.port ? `:${window.location.port}` : ''}`;
+// Production and Vite's development proxy both use the current origin.
+const API_BASE = window.location.origin;
+const WS_BASE = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
 
 // Auth helpers
 export function getToken() {
@@ -157,4 +153,21 @@ export async function getServerInfo() {
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || 'Failed to get server info');
   return data;
+}
+
+export async function terminalRequest(method = 'GET', body) {
+  const res = await fetch(`${API_BASE}/api/terminals`, {
+    method, cache: 'no-store',
+    headers: { Authorization: `Bearer ${getToken()}`, 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  if (res.status === 401) { logout(); throw new Error('Qayta kirish kerak'); }
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Terminal so‘rovi bajarilmadi');
+  return data;
+}
+
+export function createTerminalSocket(id, cols, rows) {
+  const query = new URLSearchParams({ token: getToken(), id, cols, rows });
+  return new WebSocket(`${WS_BASE}/ws/${id === 'legacy' ? 'legacy-terminal' : 'terminal'}?${query}`);
 }

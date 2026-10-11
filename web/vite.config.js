@@ -8,11 +8,11 @@ export default defineConfig({
     allowedHosts: ['desk.1pro.uz'],
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:9090',
+        target: 'http://127.0.0.1:9091',
         changeOrigin: true
       },
       '/ws': {
-        target: 'http://127.0.0.1:9090',
+        target: 'http://127.0.0.1:9091',
         ws: true
       }
     }

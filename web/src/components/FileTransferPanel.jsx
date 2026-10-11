@@ -10,6 +10,7 @@ export default function FileTransferPanel({ ws, isConnected }) {
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef(null);
   const downloadChunksRef = useRef({});
+  const currentPathRef = useRef('~');
 
   // Request directory listing
   const listDirectory = useCallback((path) => {
@@ -21,63 +22,7 @@ export default function FileTransferPanel({ ws, isConnected }) {
     }));
   }, [ws]);
 
-  // Initial load
-  useEffect(() => {
-    if (isConnected) {
-      listDirectory(currentPath);
-    }
-  }, [isConnected, listDirectory]);
-
-  // Handle incoming messages
-  useEffect(() => {
-    if (!ws) return;
-
-    const handler = (event) => {
-      if (typeof event.data !== 'string') return;
-
-      try {
-        const msg = JSON.parse(event.data);
-
-        if (msg.type === 'file_list_response' && msg.payload) {
-          setLoading(false);
-          if (msg.payload.error) {
-            console.error('File list error:', msg.payload.error);
-            return;
-          }
-          setCurrentPath(msg.payload.path);
-          setPathInput(msg.payload.path);
-
-          // Sort: directories first, then alphabetically
-          const sorted = [...(msg.payload.entries || [])].sort((a, b) => {
-            if (a.isDir && !b.isDir) return -1;
-            if (!a.isDir && b.isDir) return 1;
-            return a.name.localeCompare(b.name);
-          });
-          setEntries(sorted);
-        }
-
-        if (msg.type === 'file_data' && msg.payload) {
-          handleFileData(msg.payload);
-        }
-
-        if (msg.type === 'file_upload_status' && msg.payload) {
-          if (msg.payload.success) {
-            // Refresh current directory
-            listDirectory(currentPath);
-          } else if (msg.payload.error) {
-            alert('Upload error: ' + msg.payload.error);
-          }
-        }
-      } catch (e) {
-        // Not JSON
-      }
-    };
-
-    ws.addEventListener('message', handler);
-    return () => ws.removeEventListener('message', handler);
-  }, [ws, currentPath, listDirectory]);
-
-  const handleFileData = (payload) => {
+  const handleFileData = useCallback((payload) => {
     const key = payload.path;
 
     if (payload.error) {
@@ -131,7 +76,65 @@ export default function FileTransferPanel({ ws, isConnected }) {
       delete downloadChunksRef.current[key];
       setTimeout(() => setDownloadProgress(null), 1500);
     }
-  };
+  }, []);
+
+  // Initial load
+  useEffect(() => {
+    if (isConnected) {
+      listDirectory(currentPathRef.current);
+    }
+  }, [isConnected, listDirectory]);
+
+  // Handle incoming messages
+  useEffect(() => {
+    if (!ws) return;
+
+    const handler = (event) => {
+      if (typeof event.data !== 'string') return;
+
+      try {
+        const msg = JSON.parse(event.data);
+
+        if (msg.type === 'file_list_response' && msg.payload) {
+          setLoading(false);
+          if (msg.payload.error) {
+            console.error('File list error:', msg.payload.error);
+            return;
+          }
+          currentPathRef.current = msg.payload.path;
+          setCurrentPath(msg.payload.path);
+          setPathInput(msg.payload.path);
+
+          // Sort: directories first, then alphabetically
+          const sorted = [...(msg.payload.entries || [])].sort((a, b) => {
+            if (a.isDir && !b.isDir) return -1;
+            if (!a.isDir && b.isDir) return 1;
+            return a.name.localeCompare(b.name);
+          });
+          setEntries(sorted);
+        }
+
+        if (msg.type === 'file_data' && msg.payload) {
+          handleFileData(msg.payload);
+        }
+
+        if (msg.type === 'file_upload_status' && msg.payload) {
+          if (msg.payload.success) {
+            // Refresh current directory
+            listDirectory(currentPath);
+          } else if (msg.payload.error) {
+            alert('Upload error: ' + msg.payload.error);
+          }
+        }
+      } catch {
+        // Not JSON
+      }
+    };
+
+    ws.addEventListener('message', handler);
+    return () => ws.removeEventListener('message', handler);
+  }, [ws, currentPath, listDirectory, handleFileData]);
+
 
   const navigateTo = (entry) => {
     if (entry.isDir) {
