@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -136,6 +138,8 @@ var upgrader = websocket.Upgrader{
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("=== FastRemote Standalone Agent ===")
 
@@ -191,17 +195,27 @@ func main() {
 	if terminalErr != nil {
 		log.Fatalf("Terminal catalogue: %v", terminalErr)
 	}
-	go terminals.Checkpoint(context.Background())
+	if err := terminals.Recover(); err != nil {
+		log.Printf("[Terminal] recovery: %v", err)
+	}
+	go terminals.Checkpoint(ctx)
+	legacyRecovery := startLegacyRecovery(ctx)
 
 	// Start HTTP Server
-	startServer(port, deviceName, hostname)
+	startServer(ctx, port, deviceName, hostname)
+	if err := terminals.CheckpointNow(); err != nil {
+		log.Printf("[Terminal] final checkpoint: %v", err)
+	}
+	if legacyRecovery != nil {
+		legacyRecovery.flush()
+	}
 }
 
 // ============================================================
 // HTTP SERVER
 // ============================================================
 
-func startServer(port, dn, hostname string) {
+func startServer(ctx context.Context, port, dn, hostname string) {
 	mux := http.NewServeMux()
 
 	// API Endpoints
@@ -271,8 +285,24 @@ func startServer(port, dn, hostname string) {
 		Handler: handler,
 	}
 
-	if err := server.ListenAndServe(); err != nil {
-		log.Printf("[Server] Error: %v", err)
+	done := make(chan error, 1)
+	go func() { done <- server.ListenAndServe() }()
+	select {
+	case err := <-done:
+		if err != nil && err != http.ErrServerClosed {
+			log.Printf("[Server] Error: %v", err)
+		}
+	case <-ctx.Done():
+		// systemd stops the web unit before its terminal dependency. Checkpoint
+		// while tmux still owns the live screen, then close HTTP gracefully.
+		if err := terminals.CheckpointNow(); err != nil {
+			log.Printf("[Terminal] shutdown checkpoint: %v", err)
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[Server] shutdown: %v", err)
+		}
 	}
 }
 

@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,12 +23,15 @@ import (
 var ErrNotFound = errors.New("terminal topilmadi")
 
 type Session struct {
-	ID        string    `json:"id"`
-	Owner     string    `json:"-"`
-	Title     string    `json:"title"`
-	CreatedAt time.Time `json:"createdAt"`
-	Status    string    `json:"status"`
-	Cwd       string    `json:"cwd,omitempty"`
+	ID            string     `json:"id"`
+	Owner         string     `json:"-"`
+	Title         string     `json:"title"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	Status        string     `json:"status"`
+	Cwd           string     `json:"cwd,omitempty"`
+	RecoveredAt   *time.Time `json:"recoveredAt,omitempty"`
+	RecoveryNote  string     `json:"recoveryNote,omitempty"`
+	ResumeCommand string     `json:"resumeCommand,omitempty"`
 }
 type record struct {
 	Session
@@ -44,17 +49,17 @@ type Manager struct {
 }
 
 func New(dir, socket string) (*Manager, error) {
+	var err error
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
 	m := &Manager{dir: dir, socket: socket, data: catalogue{Active: map[string]string{}}}
 	m.sizes = make(map[string][2]int)
-	b, err := os.ReadFile(filepath.Join(dir, "sessions.json"))
-	if err == nil {
-		if err = json.Unmarshal(b, &m.data); err != nil {
-			return nil, fmt.Errorf("terminal catalogue: %w", err)
-		}
-	} else if !os.IsNotExist(err) {
+	if err := m.load(); err != nil {
 		return nil, err
 	}
 	if m.data.Active == nil {
@@ -81,7 +86,22 @@ func (m *Manager) save() error {
 	if err != nil {
 		return err
 	}
-	return atomicWrite(filepath.Join(m.dir, "sessions.json"), b)
+	path := filepath.Join(m.dir, "sessions.json")
+	// Keep the previous valid catalogue if a disk or external edit damages the
+	// primary file. Never overwrite a good backup with a damaged primary.
+	backup := b
+	if previous, readErr := os.ReadFile(path); readErr == nil {
+		var data catalogue
+		if decodeCatalogue(previous, &data) == nil {
+			backup = previous
+		}
+	} else if !os.IsNotExist(readErr) {
+		return readErr
+	}
+	if err = atomicWrite(path+".bak", backup); err != nil {
+		return err
+	}
+	return atomicWrite(path, b)
 }
 func atomicWrite(path string, b []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".terminal-*")
@@ -99,7 +119,17 @@ func atomicWrite(path string, b []byte) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	return os.Rename(f.Name(), path)
+	if err = os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	// fsync the containing directory as well as the file: rename alone does not
+	// make the new name durable across a power loss.
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 func target(id string) string { return "fr-" + id }
 func (m *Manager) find(owner, id string) (int, error) {
@@ -182,7 +212,7 @@ func (m *Manager) CreateInDirectory(owner, title, cwd string) (Session, error) {
 		return Session{}, err
 	}
 	s := Session{ID: hex.EncodeToString(id), Owner: owner, Title: strings.TrimSpace(title), CreatedAt: time.Now().UTC(), Status: "running", Cwd: cwd}
-	if _, err = m.run("new-session", "-d", "-s", target(s.ID), "-x", "120", "-y", "36", "-c", cwd); err != nil {
+	if err = m.startShell(s); err != nil {
 		return Session{}, fmt.Errorf("terminal ochilmadi: %w", err)
 	}
 	m.data.Sessions = append(m.data.Sessions, record{Session: s, Owner: owner})
@@ -247,7 +277,10 @@ func (m *Manager) Delete(owner, id string) error {
 		m.data.Active[owner] = oldActive
 		return err
 	}
-	os.Remove(filepath.Join(m.dir, id+".ansi"))
+	for _, suffix := range []string{".ansi", ".archive.ansi", ".bash_history", ".bashrc"} {
+		os.Remove(filepath.Join(m.dir, id+suffix))
+	}
+	delete(m.sizes, id)
 	return nil
 }
 func (m *Manager) Snapshot(owner, id string) ([]byte, error) {
@@ -261,6 +294,11 @@ func (m *Manager) Snapshot(owner, id string) ([]byte, error) {
 func (m *Manager) snapshot(id string) ([]byte, error) {
 	if b, err := m.run("capture-pane", "-p", "-e", "-t", target(id), "-S", "-10000"); err == nil {
 		b = []byte(strings.ReplaceAll(string(b), "\n", "\r\n"))
+		archive, readErr := readOptional(filepath.Join(m.dir, id+".archive.ansi"))
+		if readErr != nil {
+			return nil, readErr
+		}
+		b = append(archive, b...)
 		if err = atomicWrite(filepath.Join(m.dir, id+".ansi"), b); err != nil {
 			return nil, err
 		}
@@ -273,18 +311,22 @@ func (m *Manager) snapshot(id string) ([]byte, error) {
 	return b, err
 }
 func (m *Manager) Checkpoint(ctx context.Context) {
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			if err := m.CheckpointNow(); err != nil {
+				log.Printf("terminal final checkpoint: %v", err)
+			}
 			return
 		case <-t.C:
-			m.mu.Lock()
-			for _, r := range m.data.Sessions {
-				m.snapshot(r.ID)
+			if err := m.Recover(); err != nil {
+				log.Printf("terminal recovery: %v", err)
 			}
-			m.mu.Unlock()
+			if err := m.CheckpointNow(); err != nil {
+				log.Printf("terminal checkpoint: %v", err)
+			}
 		}
 	}
 }
@@ -298,7 +340,26 @@ func (m *Manager) History(owner, id string) ([]byte, error) {
 		return nil, err
 	}
 	b, err := m.run("capture-pane", "-p", "-e", "-t", target(id), "-S", "-10000", "-E", "-1")
-	return []byte(strings.ReplaceAll(string(b), "\n", "\r\n")), err
+	if err != nil {
+		return readOptional(filepath.Join(m.dir, id+".ansi"))
+	}
+	archive, err := readOptional(filepath.Join(m.dir, id+".archive.ansi"))
+	if err != nil {
+		return nil, err
+	}
+	history := append(archive, []byte(strings.ReplaceAll(string(b), "\n", "\r\n"))...)
+	if len(history) > 0 {
+		rows := 36
+		if height, heightErr := m.run("display-message", "-p", "-t", target(id), "#{pane_height}"); heightErr == nil {
+			if parsed, parseErr := strconv.Atoi(strings.TrimSpace(string(height))); parseErr == nil && parsed >= 2 && parsed <= 500 {
+				rows = parsed
+			}
+		}
+		// Move every saved line into xterm's scrollback before attach-session
+		// redraws and clears the visible viewport.
+		history = append(history, []byte(strings.Repeat("\r\n", rows))...)
+	}
+	return history, nil
 }
 func (m *Manager) Attach(owner, id string) (*exec.Cmd, error) {
 	m.mu.Lock()

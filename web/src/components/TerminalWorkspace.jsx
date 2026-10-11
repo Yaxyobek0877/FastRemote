@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { terminalRequest } from '../utils/api';
+import { restartTerminal, terminalRequest } from '../utils/api';
 import TerminalPanel from './TerminalPanel';
 
 export default function TerminalWorkspace() {
@@ -30,6 +30,15 @@ export default function TerminalWorkspace() {
     if (id !== 'legacy') terminalRequest('PATCH', { id, active: true }).catch(e => setError(e.message));
   };
   const createDialog = () => { setCustom(false); setError(''); setDialog({ type: 'create' }); };
+  const restart = async session => {
+    if (busy) return;
+    setBusy(true); setError('');
+    try {
+      const restored = await restartTerminal(session.id);
+      setSessions(current => current.map(s => s.id === restored.id ? restored : s));
+      await refresh();
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  };
   const submit = async event => {
     event.preventDefault(); if (busy) return; setBusy(true); setError('');
     try {
@@ -42,6 +51,7 @@ export default function TerminalWorkspace() {
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   };
   const selected = sessions.find(s => s.id === active);
+  const connectionState = ['stopped', 'exited'].includes(selected?.status) ? 'stopped' : 'live';
   return <div className="rd-terminal-area">
     <div className="terminal-session-bar">
       <div className="rd-terminal-tabs" role="tablist" aria-label="Terminal sessiyalari">
@@ -54,7 +64,7 @@ export default function TerminalWorkspace() {
     </div>
     {error && !dialog && <div className="terminal-alert" role="alert">{error}<button onClick={() => { setError(''); refresh(); }}>Qayta urinish</button></div>}
     {selected ? <div className="rd-terminal-panel-wrapper" id="active-terminal" role="tabpanel">
-      <TerminalPanel key={selected.id} session={selected} onRename={() => { setName(selected.title); setDialog({ type: 'rename', session: selected }); }} onRemove={() => setDialog({ type: 'remove', session: selected })} />
+      <TerminalPanel key={`${selected.id}:${selected.recoveredAt || ''}:${connectionState}`} session={selected} restarting={busy} onRestart={() => restart(selected)} onRename={() => { setName(selected.title); setDialog({ type: 'rename', session: selected }); }} onRemove={() => setDialog({ type: 'remove', session: selected })} />
     </div> : <div className="terminal-empty">
       <span className="terminal-empty-icon">&gt;_</span><h2>{loaded ? 'Ishingiz shu yerda davom etadi' : 'Terminallar yuklanmoqda…'}</h2>
       <p>Loyihani tanlang va terminal oching. Sessiyalar sahifa yopilganda ham serverda ishlashda davom etadi.</p>

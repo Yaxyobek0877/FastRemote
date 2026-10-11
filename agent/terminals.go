@@ -21,6 +21,8 @@ var terminals *terminal.Manager
 
 func registerTerminals(mux *http.ServeMux) {
 	mux.HandleFunc("/api/terminals", handleTerminals)
+	mux.HandleFunc("/api/terminals/restart", handleTerminalRestart)
+	mux.HandleFunc("/api/terminals/files", handleTerminalFiles)
 	mux.HandleFunc("/ws/terminal", handleTerminalSocket)
 	// A migration bridge keeps the already-open old shell alive during rollout.
 	// It is visible only to the explicitly configured owner, never all users.
@@ -32,7 +34,7 @@ func registerTerminals(mux *http.ServeMux) {
 		proxy := httputil.NewSingleHostReverseProxy(u)
 		mux.HandleFunc("/ws/legacy-terminal", func(w http.ResponseWriter, r *http.Request) {
 			owner, _, ok := validateToken(r.URL.Query().Get("token"))
-			if !ok || owner != os.Getenv("LEGACY_TERMINAL_OWNER") {
+			if !ok || owner != os.Getenv("LEGACY_TERMINAL_OWNER") || !legacyBridgeLive.Load() {
 				http.Error(w, "Unauthorized", 401)
 				return
 			}
@@ -64,7 +66,7 @@ func handleTerminals(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodGet {
 		sessions, active := terminals.List(owner)
-		if owner == os.Getenv("LEGACY_TERMINAL_OWNER") && os.Getenv("LEGACY_TERMINAL_URL") != "" {
+		if owner == os.Getenv("LEGACY_TERMINAL_OWNER") && legacyBridgeLive.Load() {
 			sessions = append(sessions, terminal.Session{ID: "legacy", Title: "Avvalgi terminal", Status: "legacy"})
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"sessions": sessions, "activeId": active, "projects": terminal.Projects()})
@@ -106,6 +108,38 @@ func handleTerminals(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(405)
 	}
 }
+func handleTerminalRestart(w http.ResponseWriter, r *http.Request) {
+	owner, _, valid := validateToken(r.Header.Get("Authorization"))
+	if !valid || owner == "" {
+		http.Error(w, "Unauthorized", 401)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(405)
+		return
+	}
+	if terminals == nil {
+		http.Error(w, `{"error":"Terminal xizmati mavjud emas"}`, 503)
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		terminalError(w, errors.New("noto‘g‘ri so‘rov"))
+		return
+	}
+	session, err := terminals.Restart(owner, req.ID)
+	if err != nil {
+		terminalError(w, err)
+		return
+	}
+	json.NewEncoder(w).Encode(session)
+}
+
 func terminalSize(raw string, fallback int) uint16 {
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 2 || n > 500 {
@@ -168,7 +202,7 @@ func handleTerminalSocket(w http.ResponseWriter, r *http.Request) {
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		return conn.WriteMessage(kind, b)
 	}
-	if s.Status == "stopped" {
+	if s.Status == "stopped" || s.Status == "exited" {
 		b, e := terminals.Snapshot(owner, id)
 		if e == nil {
 			write(websocket.BinaryMessage, b)

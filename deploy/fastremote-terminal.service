@@ -1,13 +1,19 @@
 [Unit]
 Description=FastRemote persistent terminal server
+StartLimitIntervalSec=0
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=notify
+NotifyAccess=all
 RuntimeDirectory=fastremote
 RuntimeDirectoryMode=0700
-ExecStart=/usr/bin/tmux -f /disk1/test_project/FastRemote/deploy/terminal.tmux.conf -S %t/fastremote/tmux.sock start-server
-ExecStop=/usr/bin/tmux -S %t/fastremote/tmux.sock kill-server
+UMask=0077
+ExecStart=/disk1/test_project/FastRemote/deploy/terminal-server.sh /disk1/test_project/FastRemote/deploy/terminal.tmux.conf %t/fastremote/tmux.sock
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=20
+TimeoutStopSec=20
+KillMode=control-group
 
 [Install]
 WantedBy=default.target

@@ -155,8 +155,8 @@ export async function getServerInfo() {
   return data;
 }
 
-export async function terminalRequest(method = 'GET', body) {
-  const res = await fetch(`${API_BASE}/api/terminals`, {
+export async function terminalRequest(method = 'GET', body, suffix = '') {
+  const res = await fetch(`${API_BASE}/api/terminals${suffix}`, {
     method, cache: 'no-store',
     headers: { Authorization: `Bearer ${getToken()}`, 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -170,4 +170,20 @@ export async function terminalRequest(method = 'GET', body) {
 export function createTerminalSocket(id, cols, rows) {
   const query = new URLSearchParams({ token: getToken(), id, cols, rows });
   return new WebSocket(`${WS_BASE}/ws/${id === 'legacy' ? 'legacy-terminal' : 'terminal'}?${query}`);
+}
+
+export function restartTerminal(id) {
+  return terminalRequest('POST', { id }, '/restart');
+}
+
+export async function uploadTerminalFiles(id, files) {
+  const form = new FormData();
+  for (const file of files) form.append('files', file, file.name || 'clipboard.png');
+  const response = await fetch(`${API_BASE}/api/terminals/files?id=${encodeURIComponent(id)}`, {
+    method: 'POST', headers: { Authorization: `Bearer ${getToken()}` }, body: form,
+  });
+  if (response.status === 401) { logout(); throw new Error('Qayta kirish kerak'); }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || (response.status === 413 ? 'Fayl hajmi chegaradan oshdi.' : 'Fayl yuklanmadi. Qayta urinib ko‘ring.'));
+  return data;
 }
